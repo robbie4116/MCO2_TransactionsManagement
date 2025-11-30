@@ -167,8 +167,6 @@ def to_log_node_name(node_name):
     if node_name in mapping:
         return mapping[node_name]
     return str(node_name)[:10]
-
-
 def choose_target_nodes_by_year(date_value):
     """
     Decide which fragment nodes should store the row based on newdate.
@@ -354,7 +352,7 @@ def log_transaction_event(node_name, trans_id, op_type, pk_value, old_amount=Non
             """,
             (
                 trans_id,
-                to_log_node_name(node_name),
+                        to_log_node_name(node_name),
                 "trans",
                 op_type,
                 pk_value,
@@ -1648,11 +1646,10 @@ with tab5:
                     db = DatabaseConnection(NODE_CONFIGS[selected_node])
                     if db.connect():
                         result = db.execute_query(query, params=params, fetch=False)
-                        
+
                         if isinstance(result, dict) and not result.get("error"):
                             st.success(f"Record inserted successfully on {selected_node}")
                             st.json(result)
-
                             if 'generated_trans_id' in st.session_state:
                                 del st.session_state.generated_trans_id
 
@@ -1666,7 +1663,7 @@ with tab5:
                                 new_amount=amount,
                                 status="COMMITTED"
                             )
-                            
+
                             # replicate
                             if selected_node == "Central Node":
                                 targets = choose_target_nodes_by_year(newdate)
@@ -1696,11 +1693,12 @@ with tab5:
                                 )
                                 if not ok:
                                     st.warning(f"Replication to Central failed: {err}")
+
                         elif isinstance(result, dict) and result.get("error"):
                             st.error(f"Insert failed: {result.get('error', 'Unknown error')}")
                         else:
                             st.error(f"Insert failed: Unexpected result type")
-                        
+
                         db.close()
                     else:
                         st.error(f"Failed to connect to {selected_node}")
