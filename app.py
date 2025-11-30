@@ -39,31 +39,30 @@ NODE_CONFIGS = {
     }
 }
 
-""" # TO RUN LOCAL, use the following NODE_CONFIGS instead
-NODE_CONFIGS = {
-    "Central Node": {
-        "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
-        "port": 60703, # TO RUN LOCAL, change to 60703
-        "user": "user1",
-        "password": "UserPass123!",
-        "database": "mco2financedata"
-    },
-    "Node 2": {
-        "host": "ccscloud.dlsu.edu.ph",  # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
-        "port": 60704, # TO RUN LOCAL, change to 60704
-        "user": "user1",
-        "password": "UserPass123!",
-        "database": "mco2financedata"
-    },
-    "Node 3": {
-        "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
-        "port": 60705, # TO RUN LOCAL, change to 60705
-        "user": "user1",
-        "password": "UserPass123!",
-        "database": "mco2financedata"
-    }
-}
-"""
+# TO RUN LOCAL, use the following NODE_CONFIGS instead
+# NODE_CONFIGS = {
+#   "Central Node": {
+#         "host": "ccscloud.dlsu.edu.ph", # type: ignore # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
+#         "port": 60703, # TO RUN LOCAL, change to 60703
+#         "user": "user1",
+#         "password": "UserPass123!",
+#         "database": "mco2financedata"
+#     },
+#     "Node 2": {
+#         "host": "ccscloud.dlsu.edu.ph",  # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
+#         "port": 60704, # TO RUN LOCAL, change to 60704
+#         "user": "user1",
+#         "password": "UserPass123!",
+#         "database": "mco2financedata"
+#     },
+#     "Node 3": {
+#         "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
+#         "port": 60705, # TO RUN LOCAL, change to 60705
+#         "user": "user1",
+#         "password": "UserPass123!",
+#         "database": "mco2financedata"
+#     }
+# }
 
 
 # SESSION STATE INITIALIZATION ==============================
