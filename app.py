@@ -6,33 +6,64 @@ import time
 import threading
 from datetime import datetime
 import json
+import os
 from contextlib import contextmanager
+from dotenv import load_dotenv
+
+# LOAD ENVIRONMENT VARIABLES ==============================
+load_dotenv()
+CURRENT_NODE_NAME = os.getenv("APP_NODE_ID") if os.getenv("APP_NODE_ID") else "Central Node"
 
 # NODE CONFIGURATION ==============================
 NODE_CONFIGS = {
     "Central Node": {
-        "host": "ccscloud.dlsu.edu.ph",
-        "port": 60703,
+        "host": "10.2.14.3",
+        "port": 3306,
         "user": "user1",
         "password": "UserPass123!",
         "database": "mco2financedata"
     },
     "Node 2": {
-        "host": "ccscloud.dlsu.edu.ph",
-        "port": 60704,
+        "host": "10.2.14.4",
+        "port": 3306,
         "user": "user1",
         "password": "UserPass123!",
         "database": "mco2financedata"
     },
     "Node 3": {
-        "host": "ccscloud.dlsu.edu.ph",
-        "port": 60705,
+        "host": "10.2.14.5",
+        "port": 3306,
         "user": "user1",
         "password": "UserPass123!",
         "database": "mco2financedata"
     }
 }
 
+""" # TO RUN LOCAL, use the following NODE_CONFIGS instead
+NODE_CONFIGS = {
+    "Central Node": {
+        "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
+        "port": 60703, # TO RUN LOCAL, change to 60703
+        "user": "user1",
+        "password": "UserPass123!",
+        "database": "mco2financedata"
+    },
+    "Node 2": {
+        "host": "ccscloud.dlsu.edu.ph",  # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
+        "port": 60704, # TO RUN LOCAL, change to 60704
+        "user": "user1",
+        "password": "UserPass123!",
+        "database": "mco2financedata"
+    },
+    "Node 3": {
+        "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
+        "port": 60705, # TO RUN LOCAL, change to 60705
+        "user": "user1",
+        "password": "UserPass123!",
+        "database": "mco2financedata"
+    }
+}
+"""
 
 
 # SESSION STATE INITIALIZATION ==============================
@@ -142,7 +173,6 @@ class DatabaseConnection:
 
 
 # LOGGING & REPLICATION HELPERS ==============================
-
 def parse_year_from_date(value):
     try:
         if value is None:
@@ -1028,7 +1058,7 @@ def test_write_write_conflict(isolation_level):
 
 
 
-# REPLICATION MODULE
+# REPLICATION MODULE ==============================
 # TODO (jeff): Implement all functions in this section
 def replicate_to_central(source_node, query, params, trans_id=None, op_type=None, pk_value=None, old_amount=None, new_amount=None):
     """
@@ -1294,7 +1324,7 @@ with st.sidebar:
         st.session_state.recovery_log = []
         st.rerun()
 
-# Main Tabs
+# MAIN TABS ==============================
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Database View", 
     "Concurrency Testing", 
@@ -1303,7 +1333,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Database Operations"
 ])
 
-# TAB 1: DATABASE VIEW
+# TAB 1: DATABASE VIEW ==============================
 with tab1:
     st.header("Current Database State Across All Nodes")
     
@@ -1336,7 +1366,7 @@ with tab1:
         st.error(f"Error fetching Node 3 data: {e}")
 
 
-# TAB 2: CONCURRENCY TESTING
+# TAB 2: CONCURRENCY TESTING ==============================
 # TODO (emman): Create UI for thara's test cases
 # TODO (thara): Wire up your test functions here
 with tab2:
@@ -1398,7 +1428,7 @@ with tab2:
     else:
         st.info("No transactions logged yet...")
 
-# TAB 3: FAILURE RECOVERY TESTING
+# TAB 3: FAILURE RECOVERY TESTING ==============================
 with tab3:
     st.header("Global Failure Recovery Testing")
     
@@ -1481,7 +1511,7 @@ with tab3:
         st.info("No recovery logs available yet...")
 
 
-# TAB 4: TRANSACTION LOGS
+# TAB 4: TRANSACTION LOGS ==============================
 with tab4:
     st.header("Transaction & Replication Logs")
     
@@ -1543,7 +1573,7 @@ with tab4:
         display_log("Recovery Logs", st.session_state.get("recovery_log", []))
     
     
-# TAB 5: MANUAL OPERATIONS
+# TAB 5: MANUAL OPERATIONS ==============================
 with tab5:
     st.header("Manual Database Operations")
     
