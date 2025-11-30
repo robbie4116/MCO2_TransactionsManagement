@@ -1122,12 +1122,13 @@ with tab5:
     selected_node = st.selectbox("Select Node", list(NODE_CONFIGS.keys()), key="manual_node")
     
     # Operation type tabs
-    crud_tab1, crud_tab2, crud_tab3, crud_tab4, crud_tab5 = st.tabs([
+    crud_tab1, crud_tab2, crud_tab3, crud_tab4, crud_tab5, crud_tab6 = st.tabs([
         "Create", 
         "Read", 
         "Update", 
         "Delete",
-        "Raw SQL"
+        "Raw SQL",
+        "Reports"
     ])
     
     # CREATE / INSERT
@@ -1411,6 +1412,110 @@ with tab5:
                     db.close()
             else:
                 st.warning("Please enter a query")
+
+    # REPORTS
+    with crud_tab6:
+        st.header("Financial Reports")
+        
+        report_tabs = st.tabs(["Account Summary", "Transaction Analysis", "High-Value Transactions"])
+        
+        # report 1: account Summary
+        with report_tabs[0]:
+            st.subheader("Account Summary Report")
+            st.markdown("Overview of account balances and transaction counts")
+            
+            report_node = st.selectbox("Select Node for Report", list(NODE_CONFIGS.keys()), key="report1_node")
+            
+            if st.button("Generate Account Summary", key="btn_report1"):
+                db = DatabaseConnection(NODE_CONFIGS[report_node])
+                if db.connect():
+                    query = """
+                    SELECT 
+                        account_id,
+                        COUNT(*) as total_transactions,
+                        MIN(balance) as min_balance,
+                        MAX(balance) as max_balance,
+                        AVG(balance) as avg_balance,
+                        SUM(amount) as total_amount
+                    FROM trans
+                    GROUP BY account_id
+                    ORDER BY total_transactions DESC
+                    LIMIT 20
+                    """
+                    result = db.execute_query(query, fetch=True)
+
+                    st.dataframe(pd.DataFrame(result), use_container_width=True)
+                    
+                    db.close()
+        
+        # report 2: transaction analysis
+        with report_tabs[1]:
+            st.subheader("Transaction Type Analysis Report")
+            st.markdown("Breakdown of transactions by type and operation")
+            
+            report_node2 = st.selectbox("Select Node for Report", list(NODE_CONFIGS.keys()), key="report2_node")
+            
+            if st.button("Generate Transaction Analysis", key="btn_report2"):
+                db = DatabaseConnection(NODE_CONFIGS[report_node2])
+                if db.connect():
+                    query = """
+                    SELECT 
+                        type,
+                        operation,
+                        COUNT(*) as transaction_count,
+                        SUM(amount) as total_amount,
+                        AVG(amount) as avg_amount,
+                        MIN(amount) as min_amount,
+                        MAX(amount) as max_amount
+                    FROM trans
+                    GROUP BY type, operation
+                    ORDER BY transaction_count DESC
+                    LIMIT 15
+                    """
+                    result = db.execute_query(query, fetch=True)
+
+                    st.dataframe(pd.DataFrame(result), use_container_width=True)
+                    
+                    db.close()
+        
+        # report 3: high-value transactions
+        with report_tabs[2]:
+            st.subheader("High-Value Transactions Report")
+            st.markdown("Identify and track high-value transactions")
+            
+            report_node3 = st.selectbox("Select Node for Report", list(NODE_CONFIGS.keys()), key="report3_node")
+            threshold = st.number_input("Amount Threshold", min_value=0.0, value=10000.0, step=1000.0, format="%.2f")
+            
+            if st.button("Generate High-Value Report", key="btn_report3"):
+                db = DatabaseConnection(NODE_CONFIGS[report_node3])
+                if db.connect():
+                    query = """
+                    SELECT 
+                        trans_id,
+                        account_id,
+                        newdate,
+                        type,
+                        operation,
+                        amount,
+                        balance,
+                        account
+                    FROM trans
+                    WHERE amount >= %s
+                    ORDER BY amount DESC
+                    LIMIT 50
+                    """
+                    result = db.execute_query(query, params=(threshold,), fetch=True)
+                    
+                    if result and isinstance(result, list) and len(result) > 0:
+                        total_value = sum(row['amount'] for row in result)
+                        st.success(f"Combined Value: ${total_value:,.2f}")
+                        
+                        st.dataframe(pd.DataFrame(result), use_container_width=True)
+                        
+                    else:
+                        st.info(f"No transactions found above ${threshold:,.2f}")
+                    
+                    db.close()
 
 st.divider()
 st.caption("MCO2 - Group 8 | STADVDB - S17")
