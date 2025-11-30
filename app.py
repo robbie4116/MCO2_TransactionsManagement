@@ -141,6 +141,318 @@ class DatabaseConnection:
             self.connection.close()
 
 
+# LOGGING & REPLICATION HELPERS ==============================
+
+def parse_year_from_date(value):
+    try:
+        if value is None:
+            return None
+        if hasattr(value, "year"):
+            return value.year
+        # try ISO string
+        return datetime.fromisoformat(str(value)).year
+    except Exception:
+        return None
+
+
+def to_log_node_name(node_name):
+    """Fit node names into VARCHAR(10) columns for logs."""
+    mapping = {
+        "Central Node": "Central",
+        "Node 2": "Node2",
+        "Node 3": "Node3",
+    }
+    if not node_name:
+        return None
+    if node_name in mapping:
+        return mapping[node_name]
+    return str(node_name)[:10]
+def choose_target_nodes_by_year(date_value):
+    """
+    Decide which fragment nodes should store the row based on newdate.
+    Node 2: 1993-1995, Node 3: 1996-1998.
+    """
+    year = parse_year_from_date(date_value)
+    targets = []
+    if year is None:
+        return targets
+    if 1993 <= year <= 1995:
+        targets.append("Node 2")
+    if 1996 <= year <= 1998:
+        targets.append("Node 3")
+    return targets
+
+
+def fetch_trans_row(node_name, trans_id):
+    """Fetch a single trans row by PK from a node."""
+    db = DatabaseConnection(NODE_CONFIGS[node_name])
+    if not db.connect():
+        return None
+    row = None
+    try:
+        res = db.execute_query("SELECT * FROM trans WHERE trans_id = %s", params=(trans_id,), fetch=True)
+        if isinstance(res, list) and res:
+            row = res[0]
+    except Exception:
+        row = None
+    try:
+        db.close()
+    except Exception:
+        pass
+    return row
+
+
+def route_and_replicate_write(source_node, trans_id, op_type, row_before=None, row_after=None):
+    """
+    Decide targets and perform replication of a completed write on trans.
+    Uses row_after.newdate (fallback to row_before) for shard routing.
+    """
+    newdate = None
+    if row_after and row_after.get("newdate"):
+        newdate = row_after.get("newdate")
+    elif row_before and row_before.get("newdate"):
+        newdate = row_before.get("newdate")
+
+    old_amt = row_before.get("amount") if row_before else None
+    new_amt = row_after.get("amount") if row_after else None
+
+    # For balance-changing operations, prefer balance column
+    if row_before and "balance" in row_before:
+        old_amt = row_before.get("balance")
+    if row_after and "balance" in row_after:
+        new_amt = row_after.get("balance")
+
+    if source_node == "Central Node":
+        targets = choose_target_nodes_by_year(newdate)
+        # Build a simple deterministic update/insert/delete for the shard
+        for t in targets:
+            if op_type == "INSERT" and row_after:
+                rep_q = """
+                    INSERT INTO trans (trans_id, account_id, newdate, type, operation, amount, balance, account)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        account_id=VALUES(account_id),
+                        newdate=VALUES(newdate),
+                        type=VALUES(type),
+                        operation=VALUES(operation),
+                        amount=VALUES(amount),
+                        balance=VALUES(balance),
+                        account=VALUES(account)
+                """
+                rep_p = (
+                    row_after.get("trans_id"),
+                    row_after.get("account_id"),
+                    row_after.get("newdate"),
+                    row_after.get("type"),
+                    row_after.get("operation"),
+                    row_after.get("amount"),
+                    row_after.get("balance"),
+                    row_after.get("account"),
+                )
+            elif op_type == "UPDATE" and row_after:
+                rep_q = """
+                    UPDATE trans SET account_id=%s, newdate=%s, type=%s, operation=%s, amount=%s, balance=%s, account=%s
+                    WHERE trans_id=%s
+                """
+                rep_p = (
+                    row_after.get("account_id"),
+                    row_after.get("newdate"),
+                    row_after.get("type"),
+                    row_after.get("operation"),
+                    row_after.get("amount"),
+                    row_after.get("balance"),
+                    row_after.get("account"),
+                    trans_id,
+                )
+            elif op_type == "DELETE":
+                rep_q = "DELETE FROM trans WHERE trans_id = %s"
+                rep_p = (trans_id,)
+            else:
+                continue
+
+            replicate_from_central(
+                target_node=t,
+                query=rep_q,
+                params=rep_p,
+                trans_id=trans_id,
+                op_type=op_type,
+                pk_value=str(trans_id),
+                old_amount=old_amt,
+                new_amount=new_amt,
+            )
+    else:
+        # Source is Node 2 or Node 3 -> replicate to Central
+        if op_type == "INSERT" and row_after:
+            rep_q = """
+                INSERT INTO trans (trans_id, account_id, newdate, type, operation, amount, balance, account)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    account_id=VALUES(account_id),
+                    newdate=VALUES(newdate),
+                    type=VALUES(type),
+                    operation=VALUES(operation),
+                    amount=VALUES(amount),
+                    balance=VALUES(balance),
+                    account=VALUES(account)
+            """
+            rep_p = (
+                row_after.get("trans_id"),
+                row_after.get("account_id"),
+                row_after.get("newdate"),
+                row_after.get("type"),
+                row_after.get("operation"),
+                row_after.get("amount"),
+                row_after.get("balance"),
+                row_after.get("account"),
+            )
+        elif op_type == "UPDATE" and row_after:
+            rep_q = """
+                UPDATE trans SET account_id=%s, newdate=%s, type=%s, operation=%s, amount=%s, balance=%s, account=%s
+                WHERE trans_id=%s
+            """
+            rep_p = (
+                row_after.get("account_id"),
+                row_after.get("newdate"),
+                row_after.get("type"),
+                row_after.get("operation"),
+                row_after.get("amount"),
+                row_after.get("balance"),
+                row_after.get("account"),
+                trans_id,
+            )
+        elif op_type == "DELETE":
+            rep_q = "DELETE FROM trans WHERE trans_id = %s"
+            rep_p = (trans_id,)
+        else:
+            return
+
+        replicate_to_central(
+            source_node=source_node,
+            query=rep_q,
+            params=rep_p,
+            trans_id=trans_id,
+            op_type=op_type,
+            pk_value=str(trans_id),
+            old_amount=old_amt,
+            new_amount=new_amt,
+        )
+
+def log_transaction_event(node_name, trans_id, op_type, pk_value, old_amount=None, new_amount=None, status="PENDING", error_message=None):
+    """Write a row to transaction_log on the given node."""
+    db = DatabaseConnection(NODE_CONFIGS[node_name])
+    if not db.connect():
+        return None
+    try:
+        cur = db.connection.cursor()
+        cur.execute(
+            """
+            INSERT INTO transaction_log
+            (trans_id, node, table_name, op_type, pk_value, old_amount, new_amount, status, error_message, started_at, ended_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            """,
+            (
+                trans_id,
+                        to_log_node_name(node_name),
+                "trans",
+                op_type,
+                pk_value,
+                old_amount,
+                new_amount,
+                status,
+                error_message,
+            ),
+        )
+        db.connection.commit()
+        log_id = cur.lastrowid
+        cur.close()
+        return log_id
+    except Exception:
+        try:
+            db.connection.rollback()
+        except Exception:
+            pass
+        return None
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def insert_replication_log(source_node, target_node, trans_id, op_type, old_amount, new_amount):
+    """Insert PENDING entry into replication_log on the source node and return log_id."""
+    db = DatabaseConnection(NODE_CONFIGS[source_node])
+    if not db.connect():
+        st.warning(f"replication_log insert skipped: cannot connect to {source_node}")
+        return None
+    try:
+        cur = db.connection.cursor()
+        cur.execute(
+            """
+            INSERT INTO replication_log
+            (source_node, target_node, trans_id, op_type, old_amount, new_amount, status, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, 'PENDING', NOW())
+            """,
+            (
+                to_log_node_name(source_node),
+                to_log_node_name(target_node),
+                trans_id,
+                op_type,
+                old_amount,
+                new_amount,
+            ),
+        )
+        db.connection.commit()
+        log_id = cur.lastrowid
+        cur.close()
+        return log_id
+    except Exception as e:
+        st.warning(f"replication_log insert failed on {source_node}: {e}")
+        try:
+            db.connection.rollback()
+        except Exception:
+            pass
+        return None
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def update_replication_log_status(source_node, log_id, status, error_message=None):
+    """Update replication_log status for a given log_id on the source node."""
+    if log_id is None:
+        return
+    db = DatabaseConnection(NODE_CONFIGS[source_node])
+    if not db.connect():
+        return
+    try:
+        cur = db.connection.cursor()
+        cur.execute(
+            """
+            UPDATE replication_log
+            SET status = %s,
+                error_message = %s,
+                completed_at = CASE WHEN %s = 'SUCCESS' THEN NOW() ELSE completed_at END
+            WHERE log_id = %s
+            """,
+            (status, error_message, status, log_id),
+        )
+        db.connection.commit()
+        cur.close()
+    except Exception:
+        try:
+            db.connection.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
 # CONCURRENCY CONTROL ==============================
 # TODO (thara): Implement all functions in this section
 def set_isolation_level(connection, level, per_transaction=False):
@@ -435,6 +747,9 @@ def test_read_write_conflict(isolation_level):
         except:
             pass
 
+        # Capture state before update
+        row_before = fetch_trans_row(writer_node, trans_id)
+
         # Update then sleep inside DB so the transaction holds locks/snapshot as required
         w = execute_concurrent_transaction(
             writer_node,
@@ -443,6 +758,29 @@ def test_read_write_conflict(isolation_level):
             isolation_level,
             transaction_id=f"RW-W-{int(time.time() * 1000)}"
         )
+
+        # Fetch after for logging/replication
+        row_after = fetch_trans_row(writer_node, trans_id)
+
+        log_transaction_event(
+            node_name=writer_node,
+            trans_id=trans_id,
+            op_type="UPDATE",
+            pk_value=str(trans_id),
+            old_amount=row_before.get("balance") if row_before else None,
+            new_amount=row_after.get("balance") if row_after else None,
+            status="COMMITTED" if not (isinstance(w, dict) and w.get("error")) else "FAILED",
+            error_message=w.get("error") if isinstance(w, dict) else None,
+        )
+
+        if not (isinstance(w, dict) and w.get("error")) and row_after:
+            route_and_replicate_write(
+                source_node=writer_node,
+                trans_id=trans_id,
+                op_type="UPDATE",
+                row_before=row_before,
+                row_after=row_after,
+            )
 
         with lock:
             writer_result = w
@@ -542,6 +880,7 @@ def test_write_write_conflict(isolation_level):
         except:
             pass
 
+        row_before = fetch_trans_row(node_a, trans_id)
         res = execute_concurrent_transaction(
             node_a,
             update_query,
@@ -549,6 +888,28 @@ def test_write_write_conflict(isolation_level):
             isolation_level,
             transaction_id=f"WW-A-{int(time.time()*1000)}"
         )
+
+        row_after = fetch_trans_row(node_a, trans_id)
+
+        log_transaction_event(
+            node_name=node_a,
+            trans_id=trans_id,
+            op_type="UPDATE",
+            pk_value=str(trans_id),
+            old_amount=row_before.get("balance") if row_before else None,
+            new_amount=row_after.get("balance") if row_after else None,
+            status="COMMITTED" if not (isinstance(res, dict) and res.get("error")) else "FAILED",
+            error_message=res.get("error") if isinstance(res, dict) else None,
+        )
+
+        if not (isinstance(res, dict) and res.get("error")) and row_after:
+            route_and_replicate_write(
+                source_node=node_a,
+                trans_id=trans_id,
+                op_type="UPDATE",
+                row_before=row_before,
+                row_after=row_after,
+            )
 
         with lock:
             writer_results["A"] = res
@@ -563,6 +924,7 @@ def test_write_write_conflict(isolation_level):
         except:
             pass
 
+        row_before = fetch_trans_row(node_b, trans_id)
         res = execute_concurrent_transaction(
             node_b,
             update_query,
@@ -570,6 +932,28 @@ def test_write_write_conflict(isolation_level):
             isolation_level,
             transaction_id=f"WW-B-{int(time.time()*1000)}"
         )
+
+        row_after = fetch_trans_row(node_b, trans_id)
+
+        log_transaction_event(
+            node_name=node_b,
+            trans_id=trans_id,
+            op_type="UPDATE",
+            pk_value=str(trans_id),
+            old_amount=row_before.get("balance") if row_before else None,
+            new_amount=row_after.get("balance") if row_after else None,
+            status="COMMITTED" if not (isinstance(res, dict) and res.get("error")) else "FAILED",
+            error_message=res.get("error") if isinstance(res, dict) else None,
+        )
+
+        if not (isinstance(res, dict) and res.get("error")) and row_after:
+            route_and_replicate_write(
+                source_node=node_b,
+                trans_id=trans_id,
+                op_type="UPDATE",
+                row_before=row_before,
+                row_after=row_after,
+            )
 
         with lock:
             writer_results["B"] = res
@@ -646,54 +1030,99 @@ def test_write_write_conflict(isolation_level):
 
 # REPLICATION MODULE
 # TODO (jeff): Implement all functions in this section
-def replicate_to_central(source_node, query, params):
+def replicate_to_central(source_node, query, params, trans_id=None, op_type=None, pk_value=None, old_amount=None, new_amount=None):
     """
     Replicate a write operation from Node 2/3 to Central Node
     
-    TODO (jeff): Implement replication logic
     Steps:
-    1. Execute the query on Central Node
-    2. Log the replication attempt
-    3. Handle replication failures (Case #1)
-    4. Return success/failure status
-    
-    This supports your master-slave or multi-master design
+    1. Log PENDING replication attempt
+    2. Execute the write on Central Node
+    3. Update replication_log with SUCCESS/FAILED
+    4. Return success flag and error (if any)
     """
-    # TODO (jeff): Add implementation
-    
-    log_entry = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
-        "source": source_node,
-        "target": "Central Node",
-        "query": query,
-        "status": "pending"  # TODO (jeff): Update based on result
-    }
-    st.session_state.replication_log.append(log_entry)
-    pass
+    log_id = insert_replication_log(
+        source_node=source_node,
+        target_node="Central Node",
+        trans_id=trans_id,
+        op_type=op_type,
+        old_amount=old_amount,
+        new_amount=new_amount,
+    )
 
-def replicate_from_central(target_node, query, params):
+    success = False
+    error_msg = None
+    try:
+        db = DatabaseConnection(NODE_CONFIGS["Central Node"])
+        if not db.connect():
+            raise Exception("Cannot connect to Central Node")
+        res = db.execute_query(query, params=params, fetch=False)
+        if isinstance(res, dict) and res.get("error"):
+            raise Exception(res.get("error"))
+        success = True
+    except Exception as e:
+        error_msg = str(e)
+    finally:
+        if log_id is not None:
+            update_replication_log_status(
+                source_node=source_node,
+                log_id=log_id,
+                status="SUCCESS" if success else "FAILED",
+                error_message=error_msg,
+            )
+        else:
+            st.warning(f"No replication_log row created for trans {trans_id} from {source_node}; replication {'succeeded' if success else 'failed'}")
+        try:
+            db.close()
+        except Exception:
+            pass
+    return success, error_msg
+
+def replicate_from_central(target_node, query, params, trans_id=None, op_type=None, pk_value=None, old_amount=None, new_amount=None):
     """
     Replicate a write operation from Central Node to Node 2/3
     
-    TODO (jeff): Implement replication logic
     Steps:
-    1. cetermine which node(s) need the update (based on fragmentation)
-    2. execute the query on target node(s)
-    3. log the replication attempt
-    4. handle replication failures (Case #3)
-    5. return success/failure status
+    1. Log PENDING replication attempt
+    2. Execute the write on target node
+    3. Update replication_log with SUCCESS/FAILED
+    4. Return success flag and error (if any)
     """
-    # TODO (jeff): Add implementation
-    
-    log_entry = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
-        "source": "Central Node",
-        "target": target_node,
-        "query": query,
-        "status": "pending"  # TODO (jeff): Update based on result
-    }
-    st.session_state.replication_log.append(log_entry)
-    pass
+    log_id = insert_replication_log(
+        source_node="Central Node",
+        target_node=target_node,
+        trans_id=trans_id,
+        op_type=op_type,
+        old_amount=old_amount,
+        new_amount=new_amount,
+    )
+
+    success = False
+    error_msg = None
+    try:
+        db = DatabaseConnection(NODE_CONFIGS[target_node])
+        if not db.connect():
+            raise Exception(f"Cannot connect to {target_node}")
+        res = db.execute_query(query, params=params, fetch=False)
+        if isinstance(res, dict) and res.get("error"):
+            raise Exception(res.get("error"))
+        success = True
+    except Exception as e:
+        error_msg = str(e)
+    finally:
+        if log_id is not None:
+            update_replication_log_status(
+                source_node="Central Node",
+                log_id=log_id,
+                status="SUCCESS" if success else "FAILED",
+                error_message=error_msg,
+            )
+        else:
+            st.warning(f"No replication_log row created for trans {trans_id} from Central to {target_node}; replication {'succeeded' if success else 'failed'}")
+        try:
+            db.close()
+        except Exception:
+            pass
+    return success, error_msg
 
 # RECOVERY MODULE
 # TODO (jeff): all functions here
@@ -1217,17 +1646,59 @@ with tab5:
                     db = DatabaseConnection(NODE_CONFIGS[selected_node])
                     if db.connect():
                         result = db.execute_query(query, params=params, fetch=False)
-                        
+
                         if isinstance(result, dict) and not result.get("error"):
                             st.success(f"Record inserted successfully on {selected_node}")
                             st.json(result)
                             if 'generated_trans_id' in st.session_state:
                                 del st.session_state.generated_trans_id
+
+                            # log local transaction
+                            log_transaction_event(
+                                node_name=selected_node,
+                                trans_id=trans_id,
+                                op_type="INSERT",
+                                pk_value=str(trans_id),
+                                old_amount=None,
+                                new_amount=amount,
+                                status="COMMITTED"
+                            )
+
+                            # replicate
+                            if selected_node == "Central Node":
+                                targets = choose_target_nodes_by_year(newdate)
+                                for t in targets:
+                                    ok, err = replicate_from_central(
+                                        target_node=t,
+                                        query=query,
+                                        params=params,
+                                        trans_id=trans_id,
+                                        op_type="INSERT",
+                                        pk_value=str(trans_id),
+                                        old_amount=None,
+                                        new_amount=amount
+                                    )
+                                    if not ok:
+                                        st.warning(f"Replication to {t} failed: {err}")
+                            else:
+                                ok, err = replicate_to_central(
+                                    source_node=selected_node,
+                                    query=query,
+                                    params=params,
+                                    trans_id=trans_id,
+                                    op_type="INSERT",
+                                    pk_value=str(trans_id),
+                                    old_amount=None,
+                                    new_amount=amount
+                                )
+                                if not ok:
+                                    st.warning(f"Replication to Central failed: {err}")
+
                         elif isinstance(result, dict) and result.get("error"):
                             st.error(f"Insert failed: {result.get('error', 'Unknown error')}")
                         else:
                             st.error(f"Insert failed: Unexpected result type")
-                        
+
                         db.close()
                     else:
                         st.error(f"Failed to connect to {selected_node}")
@@ -1329,6 +1800,7 @@ with tab5:
                 else:
                     params.append(upd_trans_id)
                     query = f"UPDATE trans SET {', '.join(updates)} WHERE trans_id = %s"
+                    existing_row = fetch_trans_row(selected_node, upd_trans_id)
                     
                     db = DatabaseConnection(NODE_CONFIGS[selected_node])
                     if db.connect():
@@ -1341,6 +1813,51 @@ with tab5:
                             else:
                                 st.warning("No records were updated (transaction ID may not exist)")
                             st.json(result)
+
+                            old_amt = existing_row.get("amount") if existing_row else None
+                            new_amt = upd_amount if upd_amount > 0 else old_amt
+                            target_date = upd_newdate if upd_newdate else (existing_row.get("newdate") if existing_row else None)
+
+                            log_transaction_event(
+                                node_name=selected_node,
+                                trans_id=upd_trans_id,
+                                op_type="UPDATE",
+                                pk_value=str(upd_trans_id),
+                                old_amount=old_amt,
+                                new_amount=new_amt,
+                                status="COMMITTED"
+                            )
+
+                            # replicate only if a row was actually updated
+                            if affected > 0:
+                                if selected_node == "Central Node":
+                                    targets = choose_target_nodes_by_year(target_date)
+                                    for t in targets:
+                                        ok, err = replicate_from_central(
+                                            target_node=t,
+                                            query=query,
+                                            params=tuple(params),
+                                            trans_id=upd_trans_id,
+                                            op_type="UPDATE",
+                                            pk_value=str(upd_trans_id),
+                                            old_amount=old_amt,
+                                            new_amount=new_amt
+                                        )
+                                        if not ok:
+                                            st.warning(f"Replication to {t} failed: {err}")
+                                else:
+                                    ok, err = replicate_to_central(
+                                        source_node=selected_node,
+                                        query=query,
+                                        params=tuple(params),
+                                        trans_id=upd_trans_id,
+                                        op_type="UPDATE",
+                                        pk_value=str(upd_trans_id),
+                                        old_amount=old_amt,
+                                        new_amount=new_amt
+                                    )
+                                    if not ok:
+                                        st.warning(f"Replication to Central failed: {err}")
                         else:
                             st.error(f"Update failed: {result.get('error', 'Unknown error')}")
                         
@@ -1362,6 +1879,7 @@ with tab5:
                 if not confirm:
                     st.error("Please confirm deletion by checking the box")
                 else:
+                    existing_row = fetch_trans_row(selected_node, del_trans_id)
                     query = "DELETE FROM trans WHERE trans_id = %s"
                     params = (del_trans_id,)
                     
@@ -1376,6 +1894,50 @@ with tab5:
                             else:
                                 st.warning("No records were deleted (transaction ID may not exist)")
                             st.json(result)
+
+                            old_amt = existing_row.get("amount") if existing_row else None
+                            target_date = existing_row.get("newdate") if existing_row else None
+
+                            # log + replicate only when a row was deleted
+                            if affected > 0:
+                                log_transaction_event(
+                                    node_name=selected_node,
+                                    trans_id=del_trans_id,
+                                    op_type="DELETE",
+                                    pk_value=str(del_trans_id),
+                                    old_amount=old_amt,
+                                    new_amount=None,
+                                    status="COMMITTED"
+                                )
+
+                                if selected_node == "Central Node":
+                                    targets = choose_target_nodes_by_year(target_date)
+                                    for t in targets:
+                                        ok, err = replicate_from_central(
+                                            target_node=t,
+                                            query=query,
+                                            params=params,
+                                            trans_id=del_trans_id,
+                                            op_type="DELETE",
+                                            pk_value=str(del_trans_id),
+                                            old_amount=old_amt,
+                                            new_amount=None
+                                        )
+                                        if not ok:
+                                            st.warning(f"Replication to {t} failed: {err}")
+                                else:
+                                    ok, err = replicate_to_central(
+                                        source_node=selected_node,
+                                        query=query,
+                                        params=params,
+                                        trans_id=del_trans_id,
+                                        op_type="DELETE",
+                                        pk_value=str(del_trans_id),
+                                        old_amount=old_amt,
+                                        new_amount=None
+                                    )
+                                    if not ok:
+                                        st.warning(f"Replication to Central failed: {err}")
                         else:
                             st.error(f"Delete failed: {result.get('error', 'Unknown error')}")
                         
