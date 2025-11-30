@@ -1495,8 +1495,8 @@ with tab4:
     nodes = ["Central Node", "Node 2", "Node 3"]
     selected_node = st.selectbox("Select Node", ["All Nodes"] + nodes, key="selected_node")
     
-    start_time = st.date_input("Start Date",  min_value=datetime(1990, 1, 1).date(), max_value=datetime(2025, 12, 31).date(), value=None, key="start_time")
-    end_time = st.date_input("End Date",  min_value=datetime(1990, 1, 1).date(), max_value=datetime(2025, 12, 31).date(), value=None, key="end_time")
+    start_time = st.date_input("Start Date",  min_value=datetime(1993, 1, 1).date(), max_value=datetime(1995, 12, 31).date(), value=None, key="start_time")
+    end_time = st.date_input("End Date",  min_value=datetime(1993, 1, 1).date(), max_value=datetime(1995, 12, 31).date(), value=None, key="end_time")
 
     status_options = ["All", "Success", "Failed"]
     selected_status = st.selectbox("Status", status_options, key="selected_status")
@@ -1575,6 +1575,29 @@ with tab5:
                             max_id = result[0].get("max_id", 0) or 0
                             st.session_state.insert_trans_id = max_id + 1
                         db.close()
+
+            # Set date range based on selected node
+            if selected_node == "Node 2":
+                min_date = datetime(1993, 1, 1).date()
+                max_date = datetime(1995, 12, 31).date()
+                date_info = "Node 2 accepts dates: 1993-1995"
+            elif selected_node == "Node 3":
+                min_date = datetime(1996, 1, 1).date()
+                max_date = datetime(1998, 12, 31).date()
+                date_info = "Node 3 accepts dates: 1996-1998"
+            else:  # Central Node
+                min_date = datetime(1993, 1, 1).date()
+                max_date = datetime(1998, 12, 31).date()
+                date_info = "Central Node accepts all dates: 1993-1998"
+
+            newdate = st.date_input(
+                "Transaction Date",
+                value=min_date,
+                min_value=min_date,
+                max_value=max_date
+            )
+
+            st.info(date_info)
             
             with col1:
                 trans_id = st.number_input(
@@ -1592,9 +1615,14 @@ with tab5:
                 trans_id = st.session_state.generated_trans_id
             
             account_id = st.number_input("Account ID", min_value=1, step=1)
-            
-            newdate = st.date_input("Transaction Date", min_value=datetime(1990, 1, 1).date(), max_value=datetime(2025, 12, 31).date())
-            
+
+            upd_newdate = st.date_input(
+                "New Transaction Date", 
+                value=datetime(1993, 1, 1).date(),
+                min_value=datetime(1993, 1, 1).date(), 
+                max_value=datetime(1998, 12, 31).date()
+            )
+
             type_options = ["Credit", "Debit (Withdrawal)", "VYBER", "Custom (type below)"]
             type_choice = st.selectbox("Type", type_options)
             
@@ -1754,7 +1782,30 @@ with tab5:
             
             st.markdown("**Update Fields** (leave blank/zero to keep current value)")
             upd_account_id = st.number_input("New Account ID", min_value=0, step=1, key="upd_acc_id")
-            upd_newdate = st.date_input("New Transaction Date", min_value=datetime(1990, 1, 1).date(), max_value=datetime(2025, 12, 31).date())
+            
+            # Set date range based on selected node
+            if selected_node == "Node 2":
+                min_date = datetime(1993, 1, 1).date()
+                max_date = datetime(1995, 12, 31).date()
+                date_info = "Node 2 accepts dates: 1993-1995"
+            elif selected_node == "Node 3":
+                min_date = datetime(1996, 1, 1).date()
+                max_date = datetime(1998, 12, 31).date()
+                date_info = "Node 3 accepts dates: 1996-1998"
+            else:  # Central Node
+                min_date = datetime(1993, 1, 1).date()
+                max_date = datetime(1998, 12, 31).date()
+                date_info = "Central Node accepts all dates: 1993-1998"
+
+            upd_newdate = st.date_input(
+                "New Transaction Date",
+                value=min_date,  # FIX: Add value parameter
+                min_value=min_date,
+                max_value=max_date
+            )
+
+            st.info(date_info)
+
             upd_type = st.text_input("New Type", key="upd_type")
             upd_operation = st.text_input("New Operation", key="upd_op")
             upd_amount = st.number_input("New Amount", min_value=0.0, step=0.01, format="%.2f", key="upd_amt")
