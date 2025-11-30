@@ -871,20 +871,21 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Concurrency Testing", 
     "Failure Recovery", 
     "Transaction Logs",
-    "DB Operations"
+    "Database Operations"
 ])
 
 # TAB 1: DATABASE VIEW
 with tab1:
     st.header("Current Database State Across All Nodes")
     
+    limit = st.number_input("Row Limit", min_value=1, step=100)
+
     if st.button("Refresh Data"):
         st.experimental_rerun()
         
-    #  Central Node 
     st.subheader("Central Node")
     try:
-        central_data = get_table_data("Central Node", "trans") 
+        central_data = get_table_data("Central Node", "trans", limit)
         st.write(f"Rows: {len(central_data)}")
         st.dataframe(central_data, use_container_width=True, height=400)
     except Exception as e:
@@ -893,7 +894,7 @@ with tab1:
     # Node 2
     st.subheader("Node 2")
     try:
-        node2_data = get_table_data("Node 2", "trans")
+        node2_data = get_table_data("Central Node", "trans", limit)
         st.write(f"Rows: {len(node2_data)}")
         st.dataframe(node2_data, use_container_width=True, height=400)
     except Exception as e:
@@ -902,7 +903,7 @@ with tab1:
     # Node 3 
     st.subheader("Node 3")
     try:
-        node3_data = get_table_data("Node 3", "trans")
+        node3_data = get_table_data("Central Node", "trans", limit)
         st.write(f"Rows: {len(node3_data)}")
         st.dataframe(node3_data, use_container_width=True, height=400)
     except Exception as e:
@@ -1115,17 +1116,18 @@ with tab4:
     if log_type in ["Recovery Logs", "All Logs"]:
         display_log("Recovery Logs", st.session_state.get("recovery_log", []))
     
-# TAB 5: DB OPERATIONS
-with tab5:
-    st.header("Database Operations")
     
-    # node selection
+# TAB 5: MANUAL OPERATIONS
+with tab5:
+    st.header("Manual Database Operations")
+    
+    # Node selection
     selected_node = st.selectbox("Select Node", list(NODE_CONFIGS.keys()), key="manual_node")
     
-    # operation type tabs
+    # Operation type tabs
     crud_tab1, crud_tab2, crud_tab3, crud_tab4, crud_tab5 = st.tabs([
-        "Create (INSERT)", 
-        "Read (SELECT)", 
+        "Create", 
+        "Read", 
         "Update", 
         "Delete",
         "Raw SQL"
@@ -1136,9 +1138,35 @@ with tab5:
         st.subheader("Insert New Record")
         
         with st.form("insert_form"):
-            trans_id = st.number_input("Transaction ID", min_value=1, step=1)
+            col1, col2 = st.columns([3, 1])
+
+            if st.form_submit_button("Generate ID"):
+                    db = DatabaseConnection(NODE_CONFIGS[selected_node])
+                    if db.connect():
+                        result = db.execute_query("SELECT MAX(trans_id) AS max_id FROM trans", fetch=True)
+                        if result and isinstance(result, list) and len(result) > 0:
+                            max_id = result[0].get("max_id", 0) or 0
+                            st.session_state.insert_trans_id = max_id + 1
+                        db.close()
+            
+            with col1:
+                trans_id = st.number_input(
+                    "Transaction ID", 
+                    min_value=1, 
+                    step=1, 
+                    key="insert_trans_id"
+                )
+            
+            with col2:
+                st.write("")  # spacing
+                st.write("")  # spacing
+
+            if 'generated_trans_id' in st.session_state and st.session_state.generated_trans_id:
+                trans_id = st.session_state.generated_trans_id
+            
             account_id = st.number_input("Account ID", min_value=1, step=1)
-            newdate = st.date_input("Transaction Date")
+            
+            newdate = st.date_input("Transaction Date", min_value=datetime(1990, 1, 1).date(), max_value=datetime(2025, 12, 31).date())
             
             type_options = ["Credit", "Debit (Withdrawal)", "VYBER", "Custom (type below)"]
             type_choice = st.selectbox("Type", type_options)
@@ -1147,9 +1175,9 @@ with tab5:
                 trans_type = st.text_input("Enter Custom Type")
             else:
                 trans_type = type_choice
-                st.text_input("Or override with custom type:", key="type_override", value="", placeholder="Leave blank to use selection above")
-                if st.session_state.get("type_override", "").strip():
-                    trans_type = st.session_state.type_override
+                type_override = st.text_input("Or override with custom type:", key="type_override", value="", placeholder="Leave blank to use selection above")
+                if type_override.strip():
+                    trans_type = type_override
             
             operation_options = [
                 "Collection from Another Bank",
@@ -1165,9 +1193,9 @@ with tab5:
                 operation = st.text_input("Enter Custom Operation")
             else:
                 operation = operation_choice
-                st.text_input("Or override with custom operation:", key="op_override", value="", placeholder="Leave blank to use selection above")
-                if st.session_state.get("op_override", "").strip():
-                    operation = st.session_state.op_override
+                op_override = st.text_input("Or override with custom operation:", key="op_override", value="", placeholder="Leave blank to use selection above")
+                if op_override.strip():
+                    operation = op_override
             
             amount = st.number_input("Amount", min_value=0.0, step=0.01, format="%.2f")
             balance = st.number_input("Balance", min_value=0.0, step=0.01, format="%.2f")
@@ -1176,6 +1204,7 @@ with tab5:
             submitted = st.form_submit_button("Insert Record")
             
             if submitted:
+                # Validation
                 if not trans_type or trans_type == "Custom (type below)":
                     st.error("Please enter a Type")
                 elif not operation or operation == "Custom (type below)":
@@ -1194,10 +1223,16 @@ with tab5:
                         if isinstance(result, dict) and not result.get("error"):
                             st.success(f"Record inserted successfully on {selected_node}")
                             st.json(result)
-                        else:
+                            if 'generated_trans_id' in st.session_state:
+                                del st.session_state.generated_trans_id
+                        elif isinstance(result, dict) and result.get("error"):
                             st.error(f"Insert failed: {result.get('error', 'Unknown error')}")
+                        else:
+                            st.error(f"Insert failed: Unexpected result type")
                         
                         db.close()
+                    else:
+                        st.error(f"Failed to connect to {selected_node}")
     
     # READ / SELECT
     with crud_tab2:
@@ -1250,7 +1285,7 @@ with tab5:
             
             st.markdown("**Update Fields** (leave blank/zero to keep current value)")
             upd_account_id = st.number_input("New Account ID", min_value=0, step=1, key="upd_acc_id")
-            upd_newdate = st.date_input("New Transaction Date", value=None, key="upd_date")
+            upd_newdate = st.date_input("New Transaction Date", min_value=datetime(1990, 1, 1).date(), max_value=datetime(2025, 12, 31).date())
             upd_type = st.text_input("New Type", key="upd_type")
             upd_operation = st.text_input("New Operation", key="upd_op")
             upd_amount = st.number_input("New Amount", min_value=0.0, step=0.01, format="%.2f", key="upd_amt")
