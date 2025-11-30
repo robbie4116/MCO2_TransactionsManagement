@@ -141,9 +141,8 @@ class DatabaseConnection:
             self.connection.close()
 
 
-# CONCURRENCY CONTROL 
+# CONCURRENCY CONTROL ==============================
 # TODO (thara): Implement all functions in this section
-
 def set_isolation_level(connection, level, per_transaction=False):
     """
     Set the isolation level for the given MySQL connection.
@@ -872,7 +871,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Concurrency Testing", 
     "Failure Recovery", 
     "Transaction Logs",
-    "Manual Operations"
+    "DB Operations"
 ])
 
 # TAB 1: DATABASE VIEW
@@ -1115,31 +1114,271 @@ with tab4:
     
     if log_type in ["Recovery Logs", "All Logs"]:
         display_log("Recovery Logs", st.session_state.get("recovery_log", []))
-
-# TAB 5: MANUAL OPERATIONS
+    
+# TAB 5: DB OPERATIONS
 with tab5:
-    st.header("Manual Database Operations")
+    st.header("Database Operations")
     
+    # node selection
     selected_node = st.selectbox("Select Node", list(NODE_CONFIGS.keys()), key="manual_node")
-    query = st.text_area("SQL Query", height=100)
-    operation_type = st.radio("Operation Type", ["Read", "Write"])
     
-    if st.button("Execute Query"):
-        if query:
+    # operation type tabs
+    crud_tab1, crud_tab2, crud_tab3, crud_tab4, crud_tab5 = st.tabs([
+        "Create (INSERT)", 
+        "Read (SELECT)", 
+        "Update", 
+        "Delete",
+        "Raw SQL"
+    ])
+    
+    # CREATE / INSERT
+    with crud_tab1:
+        st.subheader("Insert New Record")
+        
+        with st.form("insert_form"):
+            trans_id = st.number_input("Transaction ID", min_value=1, step=1)
+            account_id = st.number_input("Account ID", min_value=1, step=1)
+            newdate = st.date_input("Transaction Date")
+            
+            type_options = ["Credit", "Debit (Withdrawal)", "VYBER", "Custom (type below)"]
+            type_choice = st.selectbox("Type", type_options)
+            
+            if type_choice == "Custom (type below)":
+                trans_type = st.text_input("Enter Custom Type")
+            else:
+                trans_type = type_choice
+                st.text_input("Or override with custom type:", key="type_override", value="", placeholder="Leave blank to use selection above")
+                if st.session_state.get("type_override", "").strip():
+                    trans_type = st.session_state.type_override
+            
+            operation_options = [
+                "Collection from Another Bank",
+                "Credit Card Withdrawal", 
+                "Credit in Cash",
+                "Remittance to Another Bank",
+                "Withdrawal in Cash",
+                "Custom (type below)"
+            ]
+            operation_choice = st.selectbox("Operation", operation_options)
+            
+            if operation_choice == "Custom (type below)":
+                operation = st.text_input("Enter Custom Operation")
+            else:
+                operation = operation_choice
+                st.text_input("Or override with custom operation:", key="op_override", value="", placeholder="Leave blank to use selection above")
+                if st.session_state.get("op_override", "").strip():
+                    operation = st.session_state.op_override
+            
+            amount = st.number_input("Amount", min_value=0.0, step=0.01, format="%.2f")
+            balance = st.number_input("Balance", min_value=0.0, step=0.01, format="%.2f")
+            account = st.text_input("Account Number")
+            
+            submitted = st.form_submit_button("Insert Record")
+            
+            if submitted:
+                if not trans_type or trans_type == "Custom (type below)":
+                    st.error("Please enter a Type")
+                elif not operation or operation == "Custom (type below)":
+                    st.error("Please enter an Operation")
+                else:
+                    query = """
+                    INSERT INTO trans (trans_id, account_id, newdate, type, operation, amount, balance, account) 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """
+                    params = (trans_id, account_id, newdate, trans_type, operation, amount, balance, account)
+                    
+                    db = DatabaseConnection(NODE_CONFIGS[selected_node])
+                    if db.connect():
+                        result = db.execute_query(query, params=params, fetch=False)
+                        
+                        if isinstance(result, dict) and not result.get("error"):
+                            st.success(f"Record inserted successfully on {selected_node}")
+                            st.json(result)
+                        else:
+                            st.error(f"Insert failed: {result.get('error', 'Unknown error')}")
+                        
+                        db.close()
+    
+    # READ / SELECT
+    with crud_tab2:
+        st.subheader("Search and View Records")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            search_trans_id = st.number_input("Transaction ID (0 = all)", min_value=0, step=1, key="search_id")
+        
+        with col2:
+            limit = st.number_input("Limit Results", min_value=1, max_value=10000, value=100, step=10)
+        
+        if st.button("Search Records"):
+            if search_trans_id > 0:
+                query = "SELECT * FROM trans WHERE trans_id = %s"
+                params = (search_trans_id,)
+            else:
+                query = f"SELECT * FROM trans LIMIT {limit}"
+                params = None
+            
             db = DatabaseConnection(NODE_CONFIGS[selected_node])
             if db.connect():
-                result = db.execute_query(query, fetch=(operation_type == "Read"))
+                result = db.execute_query(query, params=params, fetch=True)
                 
-                if result and isinstance(result, list):
-                    st.dataframe(pd.DataFrame(result))
-                elif result:
-                    st.json(result)
+                if isinstance(result, list):
+                    if len(result) > 0:
+                        st.success(f"Found {len(result)} record(s)")
+                        st.dataframe(pd.DataFrame(result), use_container_width=True, height=400)
+                    else:
+                        st.warning("No records found matching trans_id...")
+                        if search_trans_id > 0:
+                            check_query = "SELECT trans_id FROM trans ORDER BY trans_id LIMIT 10"
+                            sample = db.execute_query(check_query, fetch=True)
+                elif isinstance(result, dict) and result.get("error"):
+                    st.error(f"Query failed: {result.get('error', 'Unknown error')}")
                 else:
-                    st.error("Query execution failed")
+                    st.error(f"Query execution failed - Unexpected result: {result}")
                 
                 db.close()
-        else:
-            st.warning("Please enter a query")
+            else:
+                st.error(f"Failed to connect to {selected_node}")
+    
+    # UPDATE
+    with crud_tab3:
+        st.subheader("Update Existing Record")
+        
+        with st.form("update_form"):
+            upd_trans_id = st.number_input("Transaction ID to Update", min_value=1, step=1, key="upd_id")
+            
+            st.markdown("**Update Fields** (leave blank/zero to keep current value)")
+            upd_account_id = st.number_input("New Account ID", min_value=0, step=1, key="upd_acc_id")
+            upd_newdate = st.date_input("New Transaction Date", value=None, key="upd_date")
+            upd_type = st.text_input("New Type", key="upd_type")
+            upd_operation = st.text_input("New Operation", key="upd_op")
+            upd_amount = st.number_input("New Amount", min_value=0.0, step=0.01, format="%.2f", key="upd_amt")
+            upd_balance = st.number_input("New Balance", min_value=0.0, step=0.01, format="%.2f", key="upd_bal")
+            upd_account = st.text_input("New Account Number", key="upd_acc")
+            
+            submitted_upd = st.form_submit_button("Update Record")
+            
+            if submitted_upd:
+                updates = []
+                params = []
+                
+                if upd_account_id > 0:
+                    updates.append("account_id = %s")
+                    params.append(upd_account_id)
+                
+                if upd_newdate is not None:
+                    updates.append("newdate = %s")
+                    params.append(upd_newdate)
+                
+                if upd_type.strip():
+                    updates.append("type = %s")
+                    params.append(upd_type)
+                
+                if upd_operation.strip():
+                    updates.append("operation = %s")
+                    params.append(upd_operation)
+                
+                if upd_amount > 0:
+                    updates.append("amount = %s")
+                    params.append(upd_amount)
+                
+                if upd_balance > 0:
+                    updates.append("balance = %s")
+                    params.append(upd_balance)
+                
+                if upd_account.strip():
+                    updates.append("account = %s")
+                    params.append(upd_account)
+                
+                if not updates:
+                    st.warning("Please specify at least one field to update")
+                else:
+                    params.append(upd_trans_id)
+                    query = f"UPDATE trans SET {', '.join(updates)} WHERE trans_id = %s"
+                    
+                    db = DatabaseConnection(NODE_CONFIGS[selected_node])
+                    if db.connect():
+                        result = db.execute_query(query, params=tuple(params), fetch=False)
+                        
+                        if isinstance(result, dict) and not result.get("error"):
+                            affected = result.get("affected_rows", 0)
+                            if affected > 0:
+                                st.success(f"Updated {affected} record(s) on {selected_node}")
+                            else:
+                                st.warning("No records were updated (transaction ID may not exist)")
+                            st.json(result)
+                        else:
+                            st.error(f"Update failed: {result.get('error', 'Unknown error')}")
+                        
+                        db.close()
+    
+    # DELETE
+    with crud_tab4:
+        st.subheader("Delete Record")
+        
+        st.warning("This operation cannot be undone!")
+        
+        with st.form("delete_form"):
+            del_trans_id = st.number_input("Transaction ID to Delete", min_value=1, step=1, key="del_id")
+            confirm = st.checkbox("I confirm I want to delete this record")
+            
+            submitted_del = st.form_submit_button("Delete Record")
+            
+            if submitted_del:
+                if not confirm:
+                    st.error("Please confirm deletion by checking the box")
+                else:
+                    query = "DELETE FROM trans WHERE trans_id = %s"
+                    params = (del_trans_id,)
+                    
+                    db = DatabaseConnection(NODE_CONFIGS[selected_node])
+                    if db.connect():
+                        result = db.execute_query(query, params=params, fetch=False)
+                        
+                        if isinstance(result, dict) and not result.get("error"):
+                            affected = result.get("affected_rows", 0)
+                            if affected > 0:
+                                st.success(f"Deleted {affected} record(s) from {selected_node}")
+                            else:
+                                st.warning("No records were deleted (transaction ID may not exist)")
+                            st.json(result)
+                        else:
+                            st.error(f"Delete failed: {result.get('error', 'Unknown error')}")
+                        
+                        db.close()
+    
+    # RAW SQL
+    with crud_tab5:
+        st.subheader("Execute SQL Query")
+        
+        query = st.text_area("SQL Query", height=150, placeholder="SELECT * FROM trans WHERE balance > 1000")
+        operation_type = st.radio("Operation Type", ["Read (SELECT)", "Write (INSERT/UPDATE/DELETE)"], key="raw_op")
+        
+        if st.button("Execute Query"):
+            if query.strip():
+                db = DatabaseConnection(NODE_CONFIGS[selected_node])
+                if db.connect():
+                    is_read = operation_type == "Read (SELECT)"
+                    result = db.execute_query(query, fetch=is_read)
+                    
+                    if result:
+                        if isinstance(result, list) and len(result) > 0:
+                            st.success(f"Query executed successfully. Returned {len(result)} row(s)")
+                            st.dataframe(pd.DataFrame(result), use_container_width=True)
+                        elif isinstance(result, list):
+                            st.info("Query executed. No rows returned.")
+                        elif result.get("error"):
+                            st.error(f"Query failed: {result['error']}")
+                        else:
+                            st.success("Query executed successfully")
+                            st.json(result)
+                    else:
+                        st.error("Query execution failed")
+                    
+                    db.close()
+            else:
+                st.warning("Please enter a query")
 
 st.divider()
 st.caption("MCO2 - Group 8 | STADVDB - S17")
