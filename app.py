@@ -1616,13 +1616,6 @@ with tab5:
             
             account_id = st.number_input("Account ID", min_value=1, step=1)
 
-            upd_newdate = st.date_input(
-                "New Transaction Date", 
-                value=datetime(1993, 1, 1).date(),
-                min_value=datetime(1993, 1, 1).date(), 
-                max_value=datetime(1998, 12, 31).date()
-            )
-
             type_options = ["Credit", "Debit (Withdrawal)", "VYBER", "Custom (type below)"]
             type_choice = st.selectbox("Type", type_options)
             
