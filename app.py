@@ -886,7 +886,6 @@ with tab1:
     st.subheader("Central Node")
     try:
         central_data = get_table_data("Central Node", "trans", limit)
-        st.write(f"Rows: {len(central_data)}")
         st.dataframe(central_data, use_container_width=True, height=400)
     except Exception as e:
         st.error(f"Error fetching Central Node data: {e}")
@@ -895,7 +894,6 @@ with tab1:
     st.subheader("Node 2")
     try:
         node2_data = get_table_data("Central Node", "trans", limit)
-        st.write(f"Rows: {len(node2_data)}")
         st.dataframe(node2_data, use_container_width=True, height=400)
     except Exception as e:
         st.error(f"Error fetching Node 2 data: {e}")
@@ -904,7 +902,6 @@ with tab1:
     st.subheader("Node 3")
     try:
         node3_data = get_table_data("Central Node", "trans", limit)
-        st.write(f"Rows: {len(node3_data)}")
         st.dataframe(node3_data, use_container_width=True, height=400)
     except Exception as e:
         st.error(f"Error fetching Node 3 data: {e}")
