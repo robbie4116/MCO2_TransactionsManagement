@@ -1066,8 +1066,8 @@ with tab4:
     nodes = ["Central Node", "Node 2", "Node 3"]
     selected_node = st.selectbox("Select Node", ["All Nodes"] + nodes, key="selected_node")
     
-    start_time = st.date_input("Start Date", value=None, key="start_time")
-    end_time = st.date_input("End Date", value=None, key="end_time")
+    start_time = st.date_input("Start Date",  min_value=datetime(1990, 1, 1).date(), max_value=datetime(2025, 12, 31).date(), value=None, key="start_time")
+    end_time = st.date_input("End Date",  min_value=datetime(1990, 1, 1).date(), max_value=datetime(2025, 12, 31).date(), value=None, key="end_time")
 
     status_options = ["All", "Success", "Failed"]
     selected_status = st.selectbox("Status", status_options, key="selected_status")
