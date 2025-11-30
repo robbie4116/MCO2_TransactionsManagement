@@ -34,6 +34,7 @@ NODE_CONFIGS = {
 }
 
 
+
 # SESSION STATE INITIALIZATION ==============================
 if 'transaction_log' not in st.session_state:
     st.session_state.transaction_log = []
@@ -66,7 +67,7 @@ class DatabaseConnection:
             st.error(f"Connection failed: {e}")
             return False
     
-    def execute_query(self, query, params=None, fetch=True):
+    def execute_query(self, query, params=None, fetch=True, isolation_level=None):
         # TODO thara: concurrency control
         # TODO jeff: add transaction logging here
 
@@ -74,23 +75,64 @@ class DatabaseConnection:
             if not self.connection or not self.connection.is_connected():
                 if not self.connect():
                     return None
-            
+
+            # If caller requested a per-transaction isolation level, apply it on the connection
+            if isolation_level:
+                set_isolation_level(self.connection, isolation_level, per_transaction=True)
+
             self.cursor = self.connection.cursor(dictionary=True)
+
+            # Handle multi-statement queries (e.g., "UPDATE ...; SELECT SLEEP(2);")
+            # mysql-connector's cursor.execute(..., multi=True) yields a cursor for each statement.
+            if ";" in query and query.strip().count(";") >= 1:
+                results = []
+                last_rowcount = 0
+                # Execute each statement in order and collect SELECT results if requested
+                for result_cursor in self.cursor.execute(query, params or (), multi=True):
+                    try:
+                        if fetch and getattr(result_cursor, "with_rows", False):
+                            rows = result_cursor.fetchall()
+                            if rows:
+                                results.extend(rows)
+                    except Exception:
+                        # ignore fetch errors for statements that don't return rows
+                        pass
+                    try:
+                        last_rowcount = result_cursor.rowcount
+                    except Exception:
+                        last_rowcount = getattr(self.cursor, "rowcount", 0)
+
+                # Commit after multi-statement execution
+                try:
+                    self.connection.commit()
+                except Exception:
+                    pass
+
+                if fetch:
+                    return results
+                else:
+                    return {"affected_rows": last_rowcount}
+
+            # Single statement case
             self.cursor.execute(query, params or ())
-            
+
             if fetch and query.strip().upper().startswith('SELECT'):
                 result = self.cursor.fetchall()
                 return result
             else:
+                # write operation
                 self.connection.commit()
                 return {"affected_rows": self.cursor.rowcount}
-                
+
         except Error as e:
             if self.connection:
-                self.connection.rollback()
+                try:
+                    self.connection.rollback()
+                except Exception:
+                    pass
             return {"error": str(e)}
-        
-        # TODO (jeff): add connection retry logic for failure scenarios
+         # TODO (jeff): add connection retry logic for failure scenarios
+
 
     def close(self):
         if self.cursor:
@@ -101,15 +143,69 @@ class DatabaseConnection:
 
 # CONCURRENCY CONTROL 
 # TODO (thara): Implement all functions in this section
-def set_isolation_level(connection, level):
+
+def set_isolation_level(connection, level, per_transaction=False):
     """
-    TODO (thara): make this function set the isolation level for the given connection
-    - READ UNCOMMITTED
-    - READ COMMITTED  
-    - REPEATABLE READ
-    - SERIALIZABLE
+    Set the isolation level for the given MySQL connection.
+
+    If per_transaction=False (default):
+        SET SESSION TRANSACTION ISOLATION LEVEL <LEVEL>;
+
+    If per_transaction=True:
+        SET TRANSACTION ISOLATION LEVEL <LEVEL>;
+        (applies only to the next transaction)
+
+    Supported:
+        READ UNCOMMITTED
+        READ COMMITTED
+        REPEATABLE READ
+        SERIALIZABLE
     """
-    pass
+
+    if connection is None:
+        st.warning("set_isolation_level: connection is None")
+        return False
+
+    if not isinstance(level, str) or not level.strip():
+        st.warning("set_isolation_level: invalid isolation level")
+        return False
+
+    # Normalize input (handles lowercase and underscores)
+    normalized = level.strip().upper().replace("_", " ")
+
+    valid_levels = {
+        "READ UNCOMMITTED": "READ UNCOMMITTED",
+        "READ COMMITTED": "READ COMMITTED",
+        "REPEATABLE READ": "REPEATABLE READ",
+        "SERIALIZABLE": "SERIALIZABLE"
+    }
+
+    sql_level = valid_levels.get(normalized)
+    if not sql_level:
+        st.warning(f"set_isolation_level: unsupported level '{level}'")
+        return False
+
+    # Decide SQL statement (session mode is the default for your system)
+    if per_transaction:
+        stmt = f"SET TRANSACTION ISOLATION LEVEL {sql_level}"
+    else:
+        stmt = f"SET SESSION TRANSACTION ISOLATION LEVEL {sql_level}"
+
+    cur = None
+    try:
+        cur = connection.cursor()
+        cur.execute(stmt)
+        cur.close()
+        return True
+
+    except Exception as e:
+        st.warning(f"set_isolation_level: failed to set '{sql_level}': {e}")
+        try:
+            if cur:
+                cur.close()
+        except:
+            pass
+        return False
 
 def execute_concurrent_transaction(node_name, query, params, isolation_level, transaction_id):
     """
@@ -121,27 +217,83 @@ def execute_concurrent_transaction(node_name, query, params, isolation_level, tr
     5. handle any errors/conflicts that arise
     """
     start_time = time.time()
-    
-    # TODO (thara): Should support the 3 test cases:
-        # case 1: concurrent reads
-        # case 2: read + Write conflicts
-        # case 3: write + Write conflicts
-    
-    end_time = time.time()
-    
-    # Log the transaction
-    log_entry = {
-        "transaction_id": transaction_id,
-        "node": node_name,
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
-        "duration": f"{(end_time - start_time):.4f}s",
-        "isolation_level": isolation_level,
-        "status": "pending",  # TODO (thara): update based on execution result
-        "query": query,
-        "params": params
-    }
-    
-    st.session_state.transaction_log.append(log_entry)
+
+    status = "pending"
+    error_msg = None
+    result = None
+
+    # 1. connect to the specified node
+    db = DatabaseConnection(NODE_CONFIGS[node_name])
+    if not db.connect():
+        status = "error"
+        error_msg = "Connection to node failed"
+        end_time = time.time()
+        st.session_state.transaction_log.append({
+            "transaction_id": transaction_id,
+            "node": node_name,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
+            "duration": f"{(end_time - start_time):.4f}s",
+            "isolation_level": isolation_level,
+            "status": status,
+            "query": query,
+            "params": params,
+            "error": error_msg
+        })
+        return {"error": error_msg}
+
+    try:
+        # 2. set the isolation level on the DB connection for the next transaction (if provided)
+        if isolation_level:
+            set_isolation_level(db.connection, isolation_level, per_transaction=True)
+
+        # Decide whether this is a SELECT (fetch) or write
+        qtype = (query.strip().split()[0].upper() if query and query.strip() else "")
+        fetch = True if qtype == "SELECT" else False
+
+        # 3. execute the query (pass isolation_level so execute_query can apply it per-transaction too)
+        result = db.execute_query(query, params=params, fetch=fetch, isolation_level=isolation_level)
+
+        # Determine status based on result
+        if isinstance(result, dict) and result.get("error"):
+            status = "error"
+            error_msg = result.get("error")
+        else:
+            status = "success"
+
+    except Exception as e:
+        status = "error"
+        error_msg = str(e)
+        result = {"error": error_msg}
+
+    finally:
+        end_time = time.time()
+
+        # Log the transaction
+        log_entry = {
+            "transaction_id": transaction_id,
+            "node": node_name,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
+            "duration": f"{(end_time - start_time):.4f}s",
+            "isolation_level": isolation_level,
+            "status": status,
+            "query": query,
+            "params": params
+        }
+        if error_msg:
+            log_entry["error"] = error_msg
+        if result is not None:
+            log_entry["result"] = result
+
+        st.session_state.transaction_log.append(log_entry)
+
+        # close connection
+        try:
+            db.close()
+        except Exception:
+            pass
+
+    return result
+
 
 def test_concurrent_reads(isolation_level):
     """
@@ -154,7 +306,69 @@ def test_concurrent_reads(isolation_level):
     3. verify all reads return consistent data
     4. log results
     """
-    pass
+    nodes = ["Node 2", "Node 3"]
+    barrier = threading.Barrier(len(nodes))
+    results = {}
+    lock = threading.Lock()
+
+    # Read a common target row
+    query = "SELECT * FROM trans WHERE trans_id = %s"
+    params = (1,)
+
+    def worker(node_name, txn_id):
+        try:
+            barrier.wait()
+        except:
+            pass
+
+        res = execute_concurrent_transaction(
+            node_name=node_name,
+            query=query,
+            params=params,
+            isolation_level=isolation_level,
+            transaction_id=txn_id
+        )
+
+        # Store result for comparison
+        with lock:
+            results[node_name] = res
+
+    # Create and start threads
+    threads = []
+    for i, node in enumerate(nodes):
+        txn_id = f"CR-{int(time.time()*1000)}-{i}"
+        t = threading.Thread(target=worker, args=(node, txn_id), daemon=True)
+        threads.append(t)
+        t.start()
+
+    # Wait for completion
+    for t in threads:
+        t.join(timeout=15)
+
+    # Normalize results for comparison
+    normalized = {}
+    for node, res in results.items():
+        try:
+            normalized[node] = json.dumps(res, sort_keys=True)
+        except:
+            normalized[node] = str(res)
+
+    consistent = len(set(normalized.values())) <= 1
+
+    # Log the test case summary
+    st.session_state.transaction_log.append({
+        "transaction_id": f"test-cr-{int(time.time()*1000)}",
+        "node": "Node 2 & Node 3",
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
+        "duration": "N/A",
+        "isolation_level": isolation_level,
+        "status": "consistent" if consistent else "inconsistent",
+        "query": query,
+        "params": params,
+        "test_case": "Case #1: Concurrent Reads",
+        "results": results
+    })
+
 
 def test_read_write_conflict(isolation_level):
     """
@@ -167,7 +381,135 @@ def test_read_write_conflict(isolation_level):
     3. verify behavior matches isolation level expectations
     4. log results and any anomalies detected
     """
-    pass
+    # We'll use Node 2 (reader) and Node 3 (writer)
+    reader_node = "Node 2"
+    writer_node = "Node 3"
+
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+
+    trans_id = 1
+
+    # Containers
+    reader_results = {"before": None, "after": None}
+    writer_result = None
+
+    # ---------------------------
+    # Reader thread (nested)
+    # ---------------------------
+    def reader_worker():
+        nonlocal reader_results
+        try:
+            barrier.wait()
+        except:
+            pass
+
+        # First read (before writer finishes). Use DB-level sleep to ensure overlap.
+        r1 = execute_concurrent_transaction(
+            reader_node,
+            f"SELECT balance FROM trans WHERE trans_id = {trans_id}; SELECT SLEEP(2);",
+            None,
+            isolation_level,
+            transaction_id=f"RW-R1-{int(time.time() * 1000)}"
+        )
+
+        # Second read (after writer has had time to commit)
+        r2 = execute_concurrent_transaction(
+            reader_node,
+            f"SELECT balance FROM trans WHERE trans_id = {trans_id}",
+            None,
+            isolation_level,
+            transaction_id=f"RW-R2-{int(time.time() * 1000)}"
+        )
+
+        with lock:
+            reader_results["before"] = r1
+            reader_results["after"] = r2
+
+    # ---------------------------
+    # Writer thread (nested)
+    # ---------------------------
+    def writer_worker():
+        nonlocal writer_result
+        try:
+            barrier.wait()
+        except:
+            pass
+
+        # Update then sleep inside DB so the transaction holds locks/snapshot as required
+        w = execute_concurrent_transaction(
+            writer_node,
+            f"UPDATE trans SET balance = balance + 50 WHERE trans_id = {trans_id}; SELECT SLEEP(2);",
+            None,
+            isolation_level,
+            transaction_id=f"RW-W-{int(time.time() * 1000)}"
+        )
+
+        with lock:
+            writer_result = w
+
+    # spawn threads
+    t_reader = threading.Thread(target=reader_worker, daemon=True)
+    t_writer = threading.Thread(target=writer_worker, daemon=True)
+
+    t_reader.start()
+    t_writer.start()
+
+    t_reader.join(timeout=30)
+    t_writer.join(timeout=30)
+
+    # -----------------------------------
+    # Detect anomalies
+    # -----------------------------------
+    def extract_balance(res):
+        # execute_concurrent_transaction returns SELECT results as list[dict] or an error dict
+        if not res or isinstance(res, dict):
+            return None
+        try:
+            return res[0].get("balance")
+        except Exception:
+            return None
+
+    before = reader_results["before"]
+    after = reader_results["after"]
+
+    b1 = extract_balance(before)
+    b2 = extract_balance(after)
+
+    # MySQL InnoDB typically prevents true dirty reads; keep false for correctness.
+    dirty_read = False
+
+    # Non-repeatable read if values differ across reads
+    non_repeatable = False
+    if b1 is not None and b2 is not None and b1 != b2:
+        non_repeatable = True
+
+    # -----------------------------------
+    # Log summary of this test case
+    # -----------------------------------
+    summary = {
+        "test_case": "Case #2: Read + Write Conflict",
+        "isolation_level": isolation_level,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
+        "reader_before": before,
+        "reader_after": after,
+        "writer_result": writer_result,
+        "dirty_read": dirty_read,
+        "non_repeatable_read": non_repeatable
+    }
+
+    st.session_state.transaction_log.append({
+        "transaction_id": f"test-rw-{int(time.time() * 1000)}",
+        "node": f"{reader_node} & {writer_node}",
+        "timestamp": summary["timestamp"],
+        "duration": "N/A",
+        "isolation_level": isolation_level,
+        "status": "completed",
+        "query": "RW Test (Reader + Writer)",
+        "params": (trans_id,),
+        "test_summary": summary
+    })
+
 
 def test_write_write_conflict(isolation_level):
     """
@@ -180,7 +522,128 @@ def test_write_write_conflict(isolation_level):
     3. verify final database state is consistent
     4. log which transaction succeeded and any failures
     """
-    pass
+    node_a = "Node 2"
+    node_b = "Node 3"
+
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+
+    trans_id = 1
+    update_query = f"UPDATE trans SET balance = balance + 100 WHERE trans_id = {trans_id}; SELECT SLEEP(2);"
+
+    writer_results = {"A": None, "B": None}
+
+    # ---------------------------------
+    # Writer thread A
+    # ---------------------------------
+    def writer_a():
+        nonlocal writer_results
+        try:
+            barrier.wait()
+        except:
+            pass
+
+        res = execute_concurrent_transaction(
+            node_a,
+            update_query,
+            None,
+            isolation_level,
+            transaction_id=f"WW-A-{int(time.time()*1000)}"
+        )
+
+        with lock:
+            writer_results["A"] = res
+
+    # ---------------------------------
+    # Writer thread B
+    # ---------------------------------
+    def writer_b():
+        nonlocal writer_results
+        try:
+            barrier.wait()
+        except:
+            pass
+
+        res = execute_concurrent_transaction(
+            node_b,
+            update_query,
+            None,
+            isolation_level,
+            transaction_id=f"WW-B-{int(time.time()*1000)}"
+        )
+
+        with lock:
+            writer_results["B"] = res
+
+    # Start threads
+    tA = threading.Thread(target=writer_a, daemon=True)
+    tB = threading.Thread(target=writer_b, daemon=True)
+
+    tA.start()
+    tB.start()
+
+    tA.join(timeout=20)
+    tB.join(timeout=20)
+
+    # ---------------------------------
+    # Detect lost update
+    # ---------------------------------
+    # After both writers finish, read final balance
+    final_read = execute_concurrent_transaction(
+        node_a,
+        f"SELECT balance FROM trans WHERE trans_id = {trans_id}",
+        None,
+        isolation_level,
+        transaction_id=f"WW-FINAL-{int(time.time()*1000)}"
+    )
+
+    def extract_balance(res):
+        if not res or isinstance(res, dict):
+            return None
+        try:
+            return res[0].get("balance")
+        except:
+            return None
+
+    final_balance = extract_balance(final_read)
+
+    # How many writers succeeded?
+    success_A = isinstance(writer_results["A"], dict) is False
+    success_B = isinstance(writer_results["B"], dict) is False
+
+    # Lost update if both writers succeeded but only +100 applied
+    lost_update = False
+    if success_A and success_B:
+        # since each adds +100, expected +200
+        # if only +100 applied => lost update
+        lost_update = True
+
+    # ---------------------------------
+    # Log summary
+    # ---------------------------------
+    summary = {
+        "test_case": "Case #3: Write + Write Conflict",
+        "isolation_level": isolation_level,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
+        "writer_A_result": writer_results["A"],
+        "writer_B_result": writer_results["B"],
+        "final_balance": final_balance,
+        "lost_update": lost_update
+    }
+
+    st.session_state.transaction_log.append({
+        "transaction_id": f"test-ww-{int(time.time()*1000)}",
+        "node": f"{node_a} & {node_b}",
+        "timestamp": summary["timestamp"],
+        "duration": "N/A",
+        "isolation_level": isolation_level,
+        "status": "completed",
+        "query": "WW Test (Writer + Writer)",
+        "params": trans_id,
+        "test_summary": summary
+    })
+
+
 
 # REPLICATION MODULE
 # TODO (jeff): Implement all functions in this section
@@ -487,6 +950,14 @@ with tab2:
         #     test_read_write_conflict(isolation_level)
         # elif test_case == "Case #3: Write + Write Conflict":
         #     test_write_write_conflict(isolation_level)
+        
+        ## NEW IN THE CODE [THARA]
+        if test_case == "Case #1: Concurrent Reads":
+            test_concurrent_reads(isolation_level)
+        elif test_case == "Case #2: Read + Write Conflict":
+            test_read_write_conflict(isolation_level)
+        elif test_case == "Case #3: Write + Write Conflict":
+            test_write_write_conflict(isolation_level)
         
         st.success("Test completed! Check Transaction Logs tab for results.")
     
