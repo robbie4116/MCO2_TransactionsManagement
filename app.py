@@ -1955,20 +1955,19 @@ with st.sidebar:
         st.rerun()
 
 # MAIN TABS ==============================
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Database View", 
     "Concurrency Testing", 
     "Failure Recovery", 
     "Log Tracking",
-    "Database Operations",
-    "Manual Transaction Control"
+    "Database Operations"
 ])
 
 # TAB 1: DATABASE VIEW ==============================
 with tab1:
     st.header("Current Database State Across All Nodes")
     
-    limit = st.number_input("Row Limit", min_value=1, step=100)
+    limit = st.number_input("Row Limit", min_value=10, step=100)
 
     if st.button("Refresh Data"):
         st.experimental_rerun()
@@ -1998,66 +1997,455 @@ with tab1:
 
 
 # TAB 2: CONCURRENCY TESTING ==============================
-# TODO (emman): Create UI for thara's test cases
-# TODO (thara): Wire up your test functions here
 with tab2:
     st.header("Concurrency Control Testing")
     
-    # Isolation level selector
-    isolation_level = st.selectbox(
-        "Select Isolation Level",
-        ["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"],
-        key="isolation_level"
-    )
+    # Create subtabs for different test modes
+    concurrency_mode, high_volume_mode = st.tabs(["Single Test", "High Volume Analysis"])
     
-    st.divider()
-    
-    # Test Case Selection
-    test_case = st.radio(
-        "Select Test Case",
-        [
-            "Case #1: Concurrent Reads",
-            "Case #2: Read + Write Conflict",
-            "Case #3: Write + Write Conflict"
-        ]
-    )
-    
-    # TODO (emman): Add input fields for test parameters
-    # - Number of concurrent transactions
-    # - Which nodes to use
-    # - Data to read/write
-    
-    if st.button("Run Concurrency Test"):
-        st.info(f"Running {test_case} with {isolation_level}...")
+    # ===== SINGLE TEST MODE =====
+    with concurrency_mode:
+        st.subheader("Run Individual Concurrency Test")
+        st.markdown("""
+        Test concurrency control at different isolation levels:
+        - **Case #1**: Multiple transactions reading the same data
+        - **Case #2**: One transaction reading while another writes
+        - **Case #3**: Multiple transactions writing the same data
+        """)
         
-        # TODO (thara): Call appropriate test function based on test_case
-        # if test_case == "Case #1: Concurrent Reads":
-        #     test_concurrent_reads(isolation_level)
-        # elif test_case == "Case #2: Read + Write Conflict":
-        #     test_read_write_conflict(isolation_level)
-        # elif test_case == "Case #3: Write + Write Conflict":
-        #     test_write_write_conflict(isolation_level)
+        col1, col2 = st.columns(2)
         
-        ## NEW IN THE CODE [THARA]
-        if test_case == "Case #1: Concurrent Reads":
-            test_concurrent_reads(isolation_level)
-        elif test_case == "Case #2: Read + Write Conflict":
-            test_read_write_conflict(isolation_level)
-        elif test_case == "Case #3: Write + Write Conflict":
-            test_write_write_conflict(isolation_level)
+        with col1:
+            isolation_level = st.selectbox(
+                "Select Isolation Level",
+                ["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"],
+                key="isolation_level_single"
+            )
         
-        st.success("Test completed! Check Transaction Logs tab for results.")
-    
-    st.divider()
-    st.subheader("Recent Test Results")
+        with col2:
+            test_case = st.selectbox(
+                "Select Test Case",
+                [
+                    "Case #1: Concurrent Reads",
+                    "Case #2: Read + Write Conflict",
+                    "Case #3: Write + Write Conflict"
+                ],
+                key="test_case_single"
+            )
+        
+        st.divider()
+        
+        if st.button("Run Test", key="run_single_test"):
+            st.info(f"🔄 Running {test_case} with {isolation_level}...")
+            
+            try:
+                if test_case == "Case #1: Concurrent Reads":
+                    test_concurrent_reads(isolation_level)
+                elif test_case == "Case #2: Read + Write Conflict":
+                    test_read_write_conflict(isolation_level)
+                elif test_case == "Case #3: Write + Write Conflict":
+                    test_write_write_conflict(isolation_level)
+                
+                st.success("✅ Test completed!")
+            except Exception as e:
+                st.error(f"❌ Test failed: {str(e)}")
+        
+        st.divider()
+        st.subheader("Test Results")
 
-    recent_transactions = st.session_state.get("transaction_log", [])
-    if recent_transactions:
-        df_recent = pd.DataFrame(recent_transactions)
-        # Show only last 10 transactions
-        st.dataframe(df_recent.tail(10), use_container_width=True, height=300)
-    else:
-        st.info("No transactions logged yet...")
+        recent_transactions = st.session_state.get("transaction_log", [])
+        if recent_transactions:
+            # Filter to only show recent test transactions
+            test_logs = [t for t in recent_transactions if "test-" in str(t.get("transaction_id", "")) or "Test Case" in str(t.get("query", ""))]
+            
+            if test_logs:
+                df_recent = pd.DataFrame(test_logs[-5:])
+                st.dataframe(df_recent, use_container_width=True, height=300)
+                
+                # Show detailed summary of last test
+                if test_logs:
+                    last_test = test_logs[-1]
+                    st.markdown("### Last Test Summary")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.metric("Isolation Level", last_test.get("isolation_level", "N/A"))
+                    with col2:
+                        st.metric("Status", last_test.get("status", "N/A"))
+                    with col3:
+                        st.metric("Duration", last_test.get("duration", "N/A"))
+                    
+                    if last_test.get("test_summary"):
+                        st.markdown("#### Anomaly Detection")
+                        summary = last_test.get("test_summary", {})
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            dirty_read = summary.get("dirty_read", False)
+                            st.metric("Dirty Reads", "❌ None" if not dirty_read else "⚠️ Detected")
+                        with col2:
+                            non_rep = summary.get("non_repeatable_read", False)
+                            st.metric("Non-Repeatable Reads", "❌ None" if not non_rep else "⚠️ Detected")
+                        with col3:
+                            lost_update = summary.get("lost_update", False)
+                            st.metric("Lost Updates", "❌ None" if not lost_update else "⚠️ Detected")
+            else:
+                st.info("No test transactions logged yet. Run a test to see results.")
+        else:
+            st.info("No transactions logged yet...")
+    
+    # ===== HIGH VOLUME TEST MODE =====
+    with high_volume_mode:
+        st.subheader("High Volume Concurrency Analysis")
+        st.markdown("""
+        ### Comprehensive Isolation Level Comparison
+        
+        This mode tests all isolation levels across all test cases to determine:
+        - Which isolation level supports highest transaction throughput
+        - Transaction success rate per isolation level
+        - Anomalies detected per isolation level
+        - Consistency guarantees per level
+        - Production recommendation
+        """)
+        
+        st.divider()
+        
+        # Configuration Section
+        st.markdown("### Test Configuration")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            num_iterations = st.number_input(
+                "Iterations per Test",
+                min_value=1,
+                max_value=5,
+                value=1,
+                help="Run each test case this many times for averaging"
+            )
+        
+        with col2:
+            selected_isolation_levels = st.multiselect(
+                "Isolation Levels",
+                ["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"],
+                default=["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"],
+                help="Which isolation levels to compare"
+            )
+        
+        with col3:
+            selected_test_cases = st.multiselect(
+                "Test Cases",
+                ["Case #1: Concurrent Reads", "Case #2: Read + Write Conflict", "Case #3: Write + Write Conflict"],
+                default=["Case #1: Concurrent Reads", "Case #2: Read + Write Conflict", "Case #3: Write + Write Conflict"],
+                help="Which test cases to include"
+            )
+        
+        st.divider()
+        
+        if st.button("🚀 Start High Volume Analysis", key="run_high_volume"):
+            if not selected_isolation_levels or not selected_test_cases:
+                st.error("❌ Please select at least one isolation level and test case")
+            else:
+                st.info(f"🔄 Starting high volume analysis...")
+                st.info(f"Configuration: {len(selected_isolation_levels)} levels × {len(selected_test_cases)} cases × {num_iterations} iterations")
+                
+                # Initialize results container
+                high_volume_results = {
+                    "isolation_level": [],
+                    "test_case": [],
+                    "iteration": [],
+                    "success": [],
+                    "failed": [],
+                    "duration": [],
+                    "anomalies": []
+                }
+                
+                # Progress tracking
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                total_tests = len(selected_isolation_levels) * len(selected_test_cases) * num_iterations
+                current_test = 0
+                
+                # Run all tests
+                for isolation in selected_isolation_levels:
+                    for test_case in selected_test_cases:
+                        for iteration in range(num_iterations):
+                            current_test += 1
+                            progress = current_test / total_tests
+                            progress_bar.progress(progress)
+                            status_text.text(f"Progress: {current_test}/{total_tests} | {isolation} | {test_case} | Iteration {iteration + 1}/{num_iterations}")
+                            
+                            # Record start time
+                            start_time = time.time()
+                            start_log_count = len(st.session_state.transaction_log)
+                            
+                            # Run the test
+                            try:
+                                if test_case == "Case #1: Concurrent Reads":
+                                    test_concurrent_reads(isolation)
+                                elif test_case == "Case #2: Read + Write Conflict":
+                                    test_read_write_conflict(isolation)
+                                elif test_case == "Case #3: Write + Write Conflict":
+                                    test_write_write_conflict(isolation)
+                            except Exception as e:
+                                st.warning(f"Test error: {str(e)}")
+                            
+                            # Record end time
+                            end_time = time.time()
+                            duration = end_time - start_time
+                            
+                            # Count transactions in this test
+                            end_log_count = len(st.session_state.transaction_log)
+                            transactions_in_test = end_log_count - start_log_count
+                            
+                            # Count successes/failures
+                            recent_logs = st.session_state.transaction_log[start_log_count:end_log_count]
+                            success_count = sum(1 for log in recent_logs if log.get("status") in ["success", "completed", "consistent"])
+                            failed_count = sum(1 for log in recent_logs if log.get("status") in ["error", "failed", "inconsistent"])
+                            
+                            # Detect anomalies
+                            anomaly_count = 0
+                            for log in recent_logs:
+                                if log.get("test_summary"):
+                                    summary = log.get("test_summary", {})
+                                    if (summary.get("dirty_read") or 
+                                        summary.get("non_repeatable_read") or 
+                                        summary.get("lost_update")):
+                                        anomaly_count += 1
+                            
+                            # Store results
+                            high_volume_results["isolation_level"].append(isolation)
+                            high_volume_results["test_case"].append(test_case)
+                            high_volume_results["iteration"].append(iteration + 1)
+                            high_volume_results["success"].append(success_count)
+                            high_volume_results["failed"].append(failed_count)
+                            high_volume_results["duration"].append(f"{duration:.2f}s")
+                            high_volume_results["anomalies"].append(anomaly_count)
+                
+                progress_bar.progress(1.0)
+                status_text.text("✅ Analysis complete!")
+                
+                # ===== DISPLAY RESULTS =====
+                st.success("✅ High Volume Analysis Complete!")
+                st.divider()
+                
+                # Create results dataframe
+                results_df = pd.DataFrame(high_volume_results)
+                
+                # ===== TAB 1: DETAILED RESULTS =====
+                st.subheader("📊 Detailed Test Results")
+                st.dataframe(results_df, use_container_width=True, height=400)
+                
+                st.divider()
+                
+                # ===== TAB 2: ISOLATION LEVEL COMPARISON =====
+                st.subheader("🔍 Isolation Level Comparison")
+                
+                comparison_data = []
+                for isolation in selected_isolation_levels:
+                    isolation_logs = results_df[results_df["isolation_level"] == isolation]
+                    
+                    total_success = isolation_logs["success"].sum()
+                    total_failed = isolation_logs["failed"].sum()
+                    total_anomalies = isolation_logs["anomalies"].sum()
+                    total_tests_count = len(isolation_logs)
+                    
+                    success_rate = (total_success / (total_success + total_failed) * 100) if (total_success + total_failed) > 0 else 0
+                    avg_duration = isolation_logs["duration"].str.rstrip("s").astype(float).mean() if len(isolation_logs) > 0 else 0
+                    
+                    comparison_data.append({
+                        "Isolation Level": isolation,
+                        "Tests Run": total_tests_count,
+                        "Successful": total_success,
+                        "Failed": total_failed,
+                        "Success Rate": f"{success_rate:.1f}%",
+                        "Anomalies": total_anomalies,
+                        "Avg Duration (s)": f"{avg_duration:.2f}"
+                    })
+                
+                comparison_df = pd.DataFrame(comparison_data)
+                st.dataframe(comparison_df, use_container_width=True, height=300)
+                
+                st.divider()
+                
+                # ===== TAB 3: ANOMALY DETECTION =====
+                st.subheader("⚠️ Anomaly Detection Matrix")
+                st.markdown("Shows which anomalies occur at each isolation level:")
+                
+                anomaly_matrix = []
+                for isolation in selected_isolation_levels:
+                    isolation_logs = results_df[results_df["isolation_level"] == isolation]
+                    
+                    total_anomalies = isolation_logs["anomalies"].sum()
+                    
+                    anomaly_matrix.append({
+                        "Isolation Level": isolation,
+                        "Total Anomalies": total_anomalies,
+                        "Consistency": "✅ Guaranteed" if total_anomalies == 0 else f"⚠️ {total_anomalies} anomalies"
+                    })
+                
+                anomaly_df = pd.DataFrame(anomaly_matrix)
+                st.dataframe(anomaly_df, use_container_width=True, height=200)
+                
+                st.divider()
+                
+                # ===== TAB 4: TEST CASE PERFORMANCE =====
+                st.subheader("📈 Performance by Test Case")
+                
+                test_case_perf = []
+                for test_case in selected_test_cases:
+                    test_logs = results_df[results_df["test_case"] == test_case]
+                    
+                    total_success = test_logs["success"].sum()
+                    total_failed = test_logs["failed"].sum()
+                    success_rate = (total_success / (total_success + total_failed) * 100) if (total_success + total_failed) > 0 else 0
+                    total_tests_count = len(test_logs)
+                    
+                    test_case_perf.append({
+                        "Test Case": test_case,
+                        "Total Runs": total_tests_count,
+                        "Success Rate": f"{success_rate:.1f}%",
+                        "Total Successes": total_success
+                    })
+                
+                test_case_df = pd.DataFrame(test_case_perf)
+                st.dataframe(test_case_df, use_container_width=True, height=200)
+                
+                st.divider()
+                
+                # ===== TAB 5: RECOMMENDATION =====
+                st.subheader("💡 Analysis & Recommendation")
+                
+                # Find best isolation levels
+                best_consistency = comparison_df.loc[comparison_df["Anomalies"].astype(int).idxmin()]
+                best_success = comparison_df.loc[comparison_df["Success Rate"].str.rstrip("%").astype(float).idxmax()]
+                
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    st.info(f"""
+                    **Best Consistency:**
+                    {best_consistency['Isolation Level']}
+                    Anomalies: {best_consistency['Anomalies']}
+                    Success: {best_consistency['Success Rate']}
+                    """)
+                
+                with col2:
+                    st.info(f"""
+                    **Highest Success Rate:**
+                    {best_success['Isolation Level']}
+                    Success: {best_success['Success Rate']}
+                    Anomalies: {best_success['Anomalies']}
+                    """)
+                
+                with col3:
+                    st.info(f"""
+                    **Test Summary:**
+                    Total Tests: {len(results_df)}
+                    Isolation Levels: {len(selected_isolation_levels)}
+                    Test Cases: {len(selected_test_cases)}
+                    """)
+                
+                st.markdown("### Key Findings")
+                
+                st.markdown(f"""
+                **Isolation Level Behavior:**
+                
+                1. **READ UNCOMMITTED** - Lowest consistency, highest throughput
+                   - May allow dirty reads
+                   - Use only for non-critical data
+                
+                2. **READ COMMITTED** - Default for most systems
+                   - Prevents dirty reads
+                   - May allow non-repeatable reads
+                   - Good balance of consistency and performance
+                
+                3. **REPEATABLE READ** - Strong consistency
+                   - Prevents dirty and non-repeatable reads
+                   - May allow phantom reads
+                   - InnoDB default
+                
+                4. **SERIALIZABLE** - Strongest consistency
+                   - Prevents all anomalies
+                   - Lowest throughput
+                   - Use for critical operations
+                
+                **Recommendation for Production:**
+                """)
+                
+                if best_consistency['Anomalies'] == '0':
+                    st.success(f"""
+                    ✅ Use **{best_consistency['Isolation Level']}**
+                    
+                    This isolation level:
+                    - Prevents all detected anomalies
+                    - Provides strong consistency guarantees
+                    - Success rate: {best_consistency['Success Rate']}
+                    - Average duration: {best_consistency['Avg Duration (s)']}s
+                    """)
+                else:
+                    st.warning(f"""
+                    ⚠️ Isolation Levels Trade-off
+                    
+                    **For Maximum Consistency:** Use {best_consistency['Isolation Level']}
+                    - Anomalies: {best_consistency['Anomalies']}
+                    
+                    **For Balance:** Use READ COMMITTED
+                    - Good consistency with reasonable performance
+                    
+                    **For High Throughput:** Use READ UNCOMMITTED
+                    - ⚠️ Use only for non-critical data
+                    """)
+                
+                st.divider()
+                
+                # ===== EXPORT =====
+                st.subheader("📥 Export Results")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    csv_data = results_df.to_csv(index=False)
+                    st.download_button(
+                        label="📊 Download Detailed Results (CSV)",
+                        data=csv_data,
+                        file_name=f"concurrency_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv"
+                    )
+                
+                with col2:
+                    summary_report = f"""
+CONCURRENCY CONTROL ANALYSIS REPORT
+Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+TEST CONFIGURATION:
+- Isolation Levels: {', '.join(selected_isolation_levels)}
+- Test Cases: {', '.join(selected_test_cases)}
+- Iterations: {num_iterations}
+- Total Tests: {len(results_df)}
+
+COMPARISON SUMMARY:
+{comparison_df.to_string(index=False)}
+
+ANOMALY SUMMARY:
+{anomaly_df.to_string(index=False)}
+
+TEST CASE PERFORMANCE:
+{test_case_df.to_string(index=False)}
+
+RECOMMENDATION:
+Use {best_consistency['Isolation Level']} for best consistency or {best_success['Isolation Level']} for best performance.
+
+For production systems, balance consistency with performance based on your requirements.
+                    """
+                    
+                    st.download_button(
+                        label="📄 Download Report (TXT)",
+                        data=summary_report,
+                        file_name=f"concurrency_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                        mime="text/plain"
+                    )
 
 # TAB 3: FAILURE RECOVERY TESTING ==============================
 with tab3:
@@ -2296,7 +2684,6 @@ with tab4:
     
     if log_type in ["Recovery Logs", "All Logs"]:
         display_log("Recovery Logs", st.session_state.get("recovery_log_db", []), "created_at")
-    
     
 # TAB 5: MANUAL OPERATIONS ==============================
 with tab5:
@@ -2877,303 +3264,6 @@ with tab5:
                         st.info(f"No transactions found above ${threshold:,.2f}")
                     
                     db.close()
-
-# TAB 6: MANUAL TRANSACTION CONTROL ==============================
-with tab6:
-    st.header("Manual Transaction Control")
-    st.info("""Control transaction lifecycle step-by-step for concurrency testing.
-    
-    **Testing with 2 instances:**
-    - Local: `streamlit run app.py --server.port 8501` and `--server.port 8502`
-    - Deployed: Open app in different browsers (Chrome, Firefox, etc.) or incognito mode
-    - Coordinate timing between instances to create concurrent scenarios
-    """)
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.subheader("Transaction Controls")
-        
-        # Node selection
-        selected_node = st.selectbox(
-            "Select Node", 
-            list(NODE_CONFIGS.keys()),
-            key="manual_txn_node",
-            disabled=st.session_state.transaction_active
-        )
-        
-        # Isolation level
-        isolation = st.selectbox(
-            "Isolation Level",
-            ["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"],
-            index=2,
-            key="manual_isolation",
-            disabled=st.session_state.transaction_active
-        )
-        
-        st.divider()
-        
-        # Transaction lifecycle buttons
-        if not st.session_state.transaction_active:
-            if st.button("START TRANSACTION", type="primary", use_container_width=True):
-                try:
-                    # Create connection
-                    db = DatabaseConnection(NODE_CONFIGS[selected_node])
-                    if not db.connect():
-                        st.error(f"Failed to connect to {selected_node}")
-                        st.stop()
-                    
-                    # Set isolation level BEFORE starting transaction
-                    set_isolation_level(db.connection, isolation, per_transaction=True)
-                    
-                    # Begin transaction
-                    db.begin_transaction()
-                    
-                    # Store in session state
-                    st.session_state.active_connection = db
-                    st.session_state.active_node = selected_node
-                    st.session_state.transaction_active = True
-                    st.session_state.transaction_operations = []
-                    st.session_state.transaction_start_time = time.time()
-                    
-                    st.success(f"Transaction started on {selected_node} with {isolation}")
-                    time.sleep(0.5)
-                    st.rerun()
-                    
-                except Exception as e:
-                    st.error(f"Failed to start transaction: {e}")
-                    import traceback
-                    st.code(traceback.format_exc())
-        else:
-            # Check connection health
-            try:
-                if st.session_state.active_connection is None or not st.session_state.active_connection.is_connection_alive():
-                    st.error("Connection lost! Transaction was automatically rolled back.")
-                    st.session_state.transaction_active = False
-                    st.session_state.active_connection = None
-                    st.session_state.active_node = None
-                    st.session_state.transaction_operations = []
-                    st.rerun()
-            except Exception as e:
-                st.error(f"Connection check failed: {e}")
-                st.session_state.transaction_active = False
-                st.session_state.active_connection = None
-                st.session_state.active_node = None
-                st.rerun()
-            
-            # Show transaction info
-            duration = time.time() - st.session_state.transaction_start_time
-            st.success(f"✅ Transaction ACTIVE on **{st.session_state.active_node}**")
-            col_d, col_i = st.columns(2)
-            with col_d:
-                st.metric("Duration", f"{duration:.1f}s")
-            with col_i:
-                st.metric("Isolation Level", isolation)
-            
-            if duration > 60:
-                st.warning(f"Transaction open for {duration:.0f}s - commit or rollback soon!")
-            
-            st.divider()
-            
-            col_commit, col_rollback = st.columns(2)
-            
-            with col_commit:
-                if st.button("✅ COMMIT", type="primary", use_container_width=True):
-                    try:
-                        st.session_state.active_connection.commit_transaction()
-                        st.session_state.active_connection.close()
-                        
-                        st.success("✅ Transaction committed successfully!")
-                        
-                        # Clean up session state
-                        st.session_state.transaction_active = False
-                        st.session_state.active_connection = None
-                        st.session_state.active_node = None
-                        st.session_state.transaction_start_time = None
-                        
-                        time.sleep(1)
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"❌ Commit failed: {e}")
-                        import traceback
-                        st.code(traceback.format_exc())
-            
-            with col_rollback:
-                if st.button("⏪ ROLLBACK", type="secondary", use_container_width=True):
-                    try:
-                        st.session_state.active_connection.rollback_transaction()
-                        st.session_state.active_connection.close()
-                        
-                        st.warning("⏪ Transaction rolled back")
-                        
-                        # Clean up session state
-                        st.session_state.transaction_active = False
-                        st.session_state.active_connection = None
-                        st.session_state.active_node = None
-                        st.session_state.transaction_start_time = None
-                        
-                        time.sleep(1)
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"❌ Rollback failed: {e}")
-                        import traceback
-                        st.code(traceback.format_exc())
-    
-    with col2:
-        st.subheader("Execute Operations")
-        
-        if not st.session_state.transaction_active:
-            st.info("⚠️ Start a transaction first to execute operations")
-        else:
-            operation_type = st.radio(
-                "Operation Type",
-                ["SELECT (Read)", "UPDATE (Write)", "Custom SQL"],
-                key="manual_op_type"
-            )
-            
-            if operation_type == "SELECT (Read)":
-                trans_id = st.number_input("Transaction ID", min_value=1, key="manual_read_id")
-                lock_for_update = st.checkbox("Lock row (FOR UPDATE)", value=False, key="lock_read")
-                
-                if st.button("Execute SELECT", use_container_width=True):
-                    try:
-                        if lock_for_update:
-                            query = "SELECT * FROM trans WHERE trans_id = %s FOR UPDATE"
-                        else:
-                            query = "SELECT * FROM trans WHERE trans_id = %s"
-                        
-                        result = st.session_state.active_connection.execute_query(
-                            query, 
-                            params=(trans_id,),
-                            fetch=True
-                        )
-                        
-                        st.session_state.transaction_operations.append({
-                            "time": datetime.now().strftime("%H:%M:%S"),
-                            "operation": "SELECT" + (" FOR UPDATE" if lock_for_update else ""),
-                            "query": query,
-                            "params": trans_id,
-                            "result": result
-                        })
-                        
-                        if result and len(result) > 0:
-                            st.success(f"✅ Read {len(result)} row(s)" + (" 🔒 (LOCKED)" if lock_for_update else ""))
-                            st.dataframe(pd.DataFrame(result), use_container_width=True)
-                        else:
-                            st.warning("⚠️ No rows found with that trans_id")
-                            
-                    except Exception as e:
-                        st.error(f"❌ SELECT failed: {e}")
-                        if "Lock wait timeout" in str(e) or "1205" in str(e):
-                            st.warning("🔒 Another transaction is holding a lock on this row!")
-                        import traceback
-                        with st.expander("Show error details"):
-                            st.code(traceback.format_exc())
-            
-            elif operation_type == "UPDATE (Write)":
-                trans_id = st.number_input("Transaction ID", min_value=1, key="manual_update_id")
-                new_balance = st.number_input("New Balance", min_value=0.0, step=0.01, key="manual_balance")
-                
-                lock_row = st.checkbox("Lock row first (SELECT FOR UPDATE)", value=True)
-                
-                if st.button("Execute UPDATE", use_container_width=True):
-                    try:
-                        operations = []
-                        
-                        if lock_row:
-                            # Lock the row first
-                            lock_query = "SELECT * FROM trans WHERE trans_id = %s FOR UPDATE"
-                            result = st.session_state.active_connection.execute_query(
-                                lock_query,
-                                params=(trans_id,),
-                                fetch=True
-                            )
-                            operations.append(f"Locked row {trans_id}")
-                            if result:
-                                st.info(f"Row locked: balance = {result[0].get('balance')}")
-                            else:
-                                st.warning("Row not found!")
-                                st.stop()
-                        
-                        # Update
-                        update_query = "UPDATE trans SET balance = %s WHERE trans_id = %s"
-                        result = st.session_state.active_connection.execute_query(
-                            update_query,
-                            params=(new_balance, trans_id),
-                            fetch=False
-                        )
-                        operations.append(f"Updated trans_id={trans_id} to balance={new_balance}")
-                        
-                        st.session_state.transaction_operations.append({
-                            "time": datetime.now().strftime("%H:%M:%S"),
-                            "operation": "UPDATE",
-                            "operations": operations,
-                            "result": result
-                        })
-                        
-                        st.success(f"✅ UPDATE executed successfully (not committed yet)")
-                        st.json(result)
-                        st.info("💡 Click COMMIT to make changes permanent or ROLLBACK to undo")
-                        
-                    except Exception as e:
-                        st.error(f"❌ UPDATE failed: {e}")
-                        if "Lock wait timeout" in str(e) or "1205" in str(e):
-                            st.warning("🔒 Lock wait timeout! Another transaction is holding the lock.")
-                        elif "Deadlock" in str(e) or "1213" in str(e):
-                            st.error("💥 Deadlock detected! This transaction was chosen as victim and rolled back.")
-                            # Reset transaction state on deadlock
-                            st.session_state.transaction_active = False
-                            if st.session_state.active_connection:
-                                try:
-                                    st.session_state.active_connection.close()
-                                except:
-                                    pass
-                            st.session_state.active_connection = None
-                            st.session_state.active_node = None
-                        import traceback
-                        with st.expander("Show error details"):
-                            st.code(traceback.format_exc())
-            
-            else:  # Custom SQL
-                custom_sql = st.text_area(
-                    "SQL Query", 
-                    height=100, 
-                    key="manual_custom_sql",
-                    placeholder="SELECT * FROM trans WHERE account_id = 1 FOR UPDATE"
-                )
-                
-                if st.button("Execute Custom SQL", use_container_width=True):
-                    if not custom_sql.strip():
-                        st.warning("Please enter a SQL query")
-                    else:
-                        try:
-                            is_select = custom_sql.strip().upper().startswith("SELECT")
-                            result = st.session_state.active_connection.execute_query(
-                                custom_sql,
-                                fetch=is_select
-                            )
-                            
-                            st.session_state.transaction_operations.append({
-                                "time": datetime.now().strftime("%H:%M:%S"),
-                                "operation": "CUSTOM",
-                                "query": custom_sql,
-                                "result": result
-                            })
-                            
-                            st.success("✅ Query executed successfully")
-                            if is_select and result:
-                                if isinstance(result, list) and len(result) > 0:
-                                    st.dataframe(pd.DataFrame(result), use_container_width=True)
-                                else:
-                                    st.info("Query returned no rows")
-                            else:
-                                st.json(result)
-                                
-                        except Exception as e:
-                            st.error(f"❌ Query failed: {e}")
-                            import traceback
-                            with st.expander("Show error details"):
-                                st.code(traceback.format_exc())
     
     # Operation Log
     st.divider()
