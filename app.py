@@ -418,60 +418,6 @@ def log_transaction_event(node_name, trans_id, op_type, pk_value, old_amount=Non
         except Exception:
             pass
 
-# FETCH DATA FROM DATABASE
-    def fetch_logs_from_db():
-        try:
-            # Use Central Node to fetch logs (or whichever node stores your logs)
-            db = DatabaseConnection(NODE_CONFIGS["Central Node"])
-            if not db.connect():
-                st.error("Failed to connect to database for logs")
-                return [], [], []
-            
-            # Transaction logs
-            transaction_logs = db.execute_query("""
-                SELECT log_id, trans_id, node, table_name, op_type, 
-                    pk_value, old_amount, new_amount, status, 
-                    error_message, started_at, ended_at
-                FROM transaction_log
-                ORDER BY started_at DESC
-                LIMIT 1000
-            """, fetch=True)
-            
-            # Replication logs
-            replication_logs = db.execute_query("""
-                SELECT log_id, source_node, target_node, trans_id, 
-                    old_amount, new_amount, op_type, status, 
-                    error_message, created_at, completed_at
-                FROM replication_log
-                ORDER BY created_at DESC
-                LIMIT 1000
-            """, fetch=True)
-            
-            # Recovery logs
-            recovery_logs = db.execute_query("""
-                SELECT log_id, node, downtime_start, downtime_end, 
-                    replayed_count, status, details, created_at, updated_at
-                FROM recovery_log
-                ORDER BY created_at DESC
-                LIMIT 1000
-            """, fetch=True)
-            
-            db.close()
-            
-            # Handle cases where queries return error dicts instead of lists
-            if not isinstance(transaction_logs, list):
-                transaction_logs = []
-            if not isinstance(replication_logs, list):
-                replication_logs = []
-            if not isinstance(recovery_logs, list):
-                recovery_logs = []
-            
-            return transaction_logs, replication_logs, recovery_logs
-            
-        except Exception as e:
-            st.error(f"Error fetching logs: {str(e)}")
-            return [], [], []
-
 def insert_replication_log(source_node, target_node, trans_id, op_type, old_amount, new_amount):
     """Insert PENDING entry into replication_log on the source node and return log_id."""
     db = DatabaseConnection(NODE_CONFIGS[source_node])
@@ -2033,9 +1979,9 @@ with tab3:
         st.info("No recovery logs available yet...")
 
 
-# TAB 4: Logging ==============================
+# TAB 4: TRANSACTION LOGS ==============================
 with tab4:
-    st.header("Transaction & Replication Logs")
+    st.header("Transaction, Replication, & Recovery Logs")
     
     # FETCH DATA FROM DATABASE - Define the function inside the tab
     def fetch_logs_from_db():
@@ -2129,21 +2075,6 @@ with tab4:
                                max_value=datetime(2025, 12, 31).date(), value=None, key="start_time")
     end_time = st.date_input("End Date", min_value=datetime(1993, 1, 1).date(), 
                              max_value=datetime(2025, 12, 31).date(), value=None, key="end_time")
-    # Restrict to known data range (1993-1998)
-    start_time = st.date_input(
-        "Start Date",
-        value=datetime(1993, 1, 1).date(),
-        min_value=datetime(1993, 1, 1).date(),
-        max_value=datetime(1998, 12, 31).date(),
-        key="start_time",
-    )
-    end_time = st.date_input(
-        "End Date",
-        value=datetime(1998, 12, 31).date(),
-        min_value=datetime(1993, 1, 1).date(),
-        max_value=datetime(1998, 12, 31).date(),
-        key="end_time",
-    )
 
     status_options = ["All", "PENDING", "COMMITTED", "ROLLED_BACK", "FAILED", "SUCCESS", "PARTIAL", "IN_PROGRESS"]
     selected_status = st.selectbox("Status", status_options, key="selected_status")
@@ -2198,14 +2129,7 @@ with tab4:
         display_log("Replication Logs", st.session_state.get("replication_log_db", []), "created_at")
     
     if log_type in ["Recovery Logs", "All Logs"]:
-        # Combine session state logs with database logs
-        session_recovery_logs = st.session_state.get("recovery_log_db", []), "created_at"
-        db_recovery_logs = fetch_recovery_logs_from_db()
-        
-        # Merge and deduplicate (prefer DB logs as source of truth)
-        all_recovery_logs = db_recovery_logs
-        
-        display_log("Recovery Logs", all_recovery_logs)
+        display_log("Recovery Logs", st.session_state.get("recovery_log_db", []), "created_at")
     
     
 # TAB 5: MANUAL OPERATIONS ==============================
