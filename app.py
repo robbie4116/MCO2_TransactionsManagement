@@ -2923,8 +2923,8 @@ with tab6:
                         st.error(f"Failed to connect to {selected_node}")
                         st.stop()
                     
-                    # Set isolation level
-                    set_isolation_level(db.connection, isolation, per_transaction=False)
+                    # Set isolation level BEFORE starting transaction
+                    set_isolation_level(db.connection, isolation, per_transaction=True)
                     
                     # Begin transaction
                     db.begin_transaction()
@@ -2936,24 +2936,39 @@ with tab6:
                     st.session_state.transaction_operations = []
                     st.session_state.transaction_start_time = time.time()
                     
-                    st.success(f"Transaction started on {selected_node}")
+                    st.success(f"Transaction started on {selected_node} with {isolation}")
+                    time.sleep(0.5)
                     st.rerun()
                     
                 except Exception as e:
                     st.error(f"Failed to start transaction: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
         else:
             # Check connection health
-            if not st.session_state.active_connection.is_connection_alive():
-                st.error("Connection lost! Transaction was automatically rolled back.")
+            try:
+                if st.session_state.active_connection is None or not st.session_state.active_connection.is_connection_alive():
+                    st.error("Connection lost! Transaction was automatically rolled back.")
+                    st.session_state.transaction_active = False
+                    st.session_state.active_connection = None
+                    st.session_state.active_node = None
+                    st.session_state.transaction_operations = []
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Connection check failed: {e}")
                 st.session_state.transaction_active = False
                 st.session_state.active_connection = None
+                st.session_state.active_node = None
                 st.rerun()
             
             # Show transaction info
             duration = time.time() - st.session_state.transaction_start_time
-            st.success(f"Transaction ACTIVE on **{st.session_state.active_node}**")
-            st.metric("Duration", f"{duration:.1f}s")
-            st.metric("Isolation Level", isolation)
+            st.success(f"✅ Transaction ACTIVE on **{st.session_state.active_node}**")
+            col_d, col_i = st.columns(2)
+            with col_d:
+                st.metric("Duration", f"{duration:.1f}s")
+            with col_i:
+                st.metric("Isolation Level", isolation)
             
             if duration > 60:
                 st.warning(f"Transaction open for {duration:.0f}s - commit or rollback soon!")
@@ -2963,38 +2978,52 @@ with tab6:
             col_commit, col_rollback = st.columns(2)
             
             with col_commit:
-                if st.button("COMMIT", type="primary", use_container_width=True):
+                if st.button("✅ COMMIT", type="primary", use_container_width=True):
                     try:
                         st.session_state.active_connection.commit_transaction()
                         st.session_state.active_connection.close()
                         
-                        st.success("Transaction committed!")
+                        st.success("✅ Transaction committed successfully!")
+                        
+                        # Clean up session state
                         st.session_state.transaction_active = False
                         st.session_state.active_connection = None
+                        st.session_state.active_node = None
+                        st.session_state.transaction_start_time = None
+                        
                         time.sleep(1)
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Commit failed: {e}")
+                        st.error(f"❌ Commit failed: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
             
             with col_rollback:
-                if st.button("ROLLBACK", type="secondary", use_container_width=True):
+                if st.button("⏪ ROLLBACK", type="secondary", use_container_width=True):
                     try:
                         st.session_state.active_connection.rollback_transaction()
                         st.session_state.active_connection.close()
                         
-                        st.warning("Transaction rolled back")
+                        st.warning("⏪ Transaction rolled back")
+                        
+                        # Clean up session state
                         st.session_state.transaction_active = False
                         st.session_state.active_connection = None
+                        st.session_state.active_node = None
+                        st.session_state.transaction_start_time = None
+                        
                         time.sleep(1)
                         st.rerun()
                     except Exception as e:
-                        st.error(f"Rollback failed: {e}")
+                        st.error(f"❌ Rollback failed: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
     
     with col2:
         st.subheader("Execute Operations")
         
         if not st.session_state.transaction_active:
-            st.info("Start a transaction first")
+            st.info("⚠️ Start a transaction first to execute operations")
         else:
             operation_type = st.radio(
                 "Operation Type",
@@ -3027,16 +3056,19 @@ with tab6:
                             "result": result
                         })
                         
-                        if result:
-                            st.success(f"Read {len(result)} row(s)" + (" with lock" if lock_for_update else ""))
+                        if result and len(result) > 0:
+                            st.success(f"✅ Read {len(result)} row(s)" + (" 🔒 (LOCKED)" if lock_for_update else ""))
                             st.dataframe(pd.DataFrame(result), use_container_width=True)
                         else:
-                            st.warning("No rows found")
+                            st.warning("⚠️ No rows found with that trans_id")
                             
                     except Exception as e:
-                        st.error(f"SELECT failed: {e}")
-                        if "Lock wait timeout" in str(e):
-                            st.warning("Another transaction is holding a lock on this row!")
+                        st.error(f"❌ SELECT failed: {e}")
+                        if "Lock wait timeout" in str(e) or "1205" in str(e):
+                            st.warning("🔒 Another transaction is holding a lock on this row!")
+                        import traceback
+                        with st.expander("Show error details"):
+                            st.code(traceback.format_exc())
             
             elif operation_type == "UPDATE (Write)":
                 trans_id = st.number_input("Transaction ID", min_value=1, key="manual_update_id")
@@ -3079,16 +3111,28 @@ with tab6:
                             "result": result
                         })
                         
-                        st.success(f"UPDATE executed (not committed yet)")
+                        st.success(f"✅ UPDATE executed successfully (not committed yet)")
                         st.json(result)
-                        st.info("Click COMMIT to make changes permanent")
+                        st.info("💡 Click COMMIT to make changes permanent or ROLLBACK to undo")
                         
                     except Exception as e:
-                        st.error(f"UPDATE failed: {e}")
+                        st.error(f"❌ UPDATE failed: {e}")
                         if "Lock wait timeout" in str(e) or "1205" in str(e):
-                            st.warning("Lock wait timeout! Another transaction is holding the lock.")
+                            st.warning("🔒 Lock wait timeout! Another transaction is holding the lock.")
                         elif "Deadlock" in str(e) or "1213" in str(e):
-                            st.error("Deadlock detected! This transaction was chosen as victim.")
+                            st.error("💥 Deadlock detected! This transaction was chosen as victim and rolled back.")
+                            # Reset transaction state on deadlock
+                            st.session_state.transaction_active = False
+                            if st.session_state.active_connection:
+                                try:
+                                    st.session_state.active_connection.close()
+                                except:
+                                    pass
+                            st.session_state.active_connection = None
+                            st.session_state.active_node = None
+                        import traceback
+                        with st.expander("Show error details"):
+                            st.code(traceback.format_exc())
             
             else:  # Custom SQL
                 custom_sql = st.text_area(
@@ -3116,14 +3160,20 @@ with tab6:
                                 "result": result
                             })
                             
-                            st.success("Query executed")
+                            st.success("✅ Query executed successfully")
                             if is_select and result:
-                                st.dataframe(pd.DataFrame(result), use_container_width=True)
+                                if isinstance(result, list) and len(result) > 0:
+                                    st.dataframe(pd.DataFrame(result), use_container_width=True)
+                                else:
+                                    st.info("Query returned no rows")
                             else:
                                 st.json(result)
                                 
                         except Exception as e:
-                            st.error(f"Query failed: {e}")
+                            st.error(f"❌ Query failed: {e}")
+                            import traceback
+                            with st.expander("Show error details"):
+                                st.code(traceback.format_exc())
     
     # Operation Log
     st.divider()
