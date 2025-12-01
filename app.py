@@ -1873,6 +1873,10 @@ def get_table_data(node_name, trans=None, limit=100):
     db.close()
     return result
 
+def invalidate_log_cache():
+    for key in ("transaction_log_db", "replication_log_db", "recovery_log_db"):
+        st.session_state.pop(key, None)
+
 # Sidebar - Node Status
 with st.sidebar:
     st.header("Node Status")
@@ -2011,21 +2015,25 @@ with tab3:
     )
     
     # TODO (emman): Add controls for:
-    # - Which node to fail/recover
     # - Number of transactions to execute during failure
     # - Data to use for testing
     
+    selected_recovery_node = st.selectbox("Select Node", list(NODE_CONFIGS.keys()), key="recovery_node_select")
     col1, col2 = st.columns(2)
     
     with col1:
-        if st.button("Simulate Node Failure"):
-            # TODO (jeff): call simulate_node_failure() for selected node
-            st.warning("Node failure simulated")
+        if st.button("Simulate Node Failure", key="simulate_failure"):
+            simulate_node_failure(selected_recovery_node)
+            invalidate_log_cache()
+            st.warning(f"{selected_recovery_node} failure simulated")
     
     with col2:
-        if st.button("Simulate Node Recovery"):
-            # TODO (jeff): call simulate_node_recovery() for selected node
-            st.success("Node recovery initiated")
+        if st.button("Simulate Node Recovery", key="simulate_recovery"):
+            was_failed = selected_recovery_node in st.session_state.simulated_failures
+            simulate_node_recovery(selected_recovery_node)
+            invalidate_log_cache()
+            if was_failed:
+                st.success(f"{selected_recovery_node} recovery completed")
     
     st.divider()
     
