@@ -101,6 +101,13 @@ class DatabaseConnection:
         self.cursor = None
         
     def connect(self):
+        # honor simulated offline state based on node config
+        try:
+            for name, cfg in NODE_CONFIGS.items():
+                if cfg == self.config and not st.session_state.node_status.get(name, True):
+                    return False
+        except Exception:
+            pass
         try:
             self.connection = mysql.connector.connect(**self.config)
             # Set timezone to Manila for this connection
@@ -1216,13 +1223,28 @@ def log_write_operation(node, query, params, transaction_id):
     """
     Log write operations for recovery purposes
     
-    TODO (jeff): Implement write-ahead logging or similar mechanism
-    This log will be used when nodes recover from failure to replay missed transactions
-    
-    Store: timestamp, node, query, params, transaction_id, status
-    Consider: file-based log, database log table, or in-memory structure
+    Basic stub: insert a PENDING entry in transaction_log before execution.
     """
-    pass
+    try:
+        db = DatabaseConnection(NODE_CONFIGS[node])
+        if not db.connect():
+            return None
+        cur = db.connection.cursor()
+        cur.execute(
+            """
+            INSERT INTO transaction_log
+            (trans_id, node, table_name, op_type, pk_value, status, started_at)
+            VALUES (%s, %s, %s, %s, %s, 'PENDING', NOW())
+            """,
+            (transaction_id, to_log_node_name(node), "trans", "UNKNOWN", str(transaction_id)),
+        )
+        db.connection.commit()
+        log_id = cur.lastrowid
+        cur.close()
+        db.close()
+        return log_id
+    except Exception:
+        return None
 
 def simulate_node_failure(node_name):
     print(f"\n{'='*60}")
@@ -1231,28 +1253,37 @@ def simulate_node_failure(node_name):
     
     try: 
         # Get timestamp from MySQL to ensure consistency
-        db = DatabaseConnection(NODE_CONFIGS["Central Node"])
-        if db.connect():
-            failure_time = get_mysql_now(db.connection)
-            
-            # Store in session state
-            st.session_state.node_status[node_name] = False
-            st.session_state.simulated_failures[node_name] = failure_time
-            
-            print(f"[FAILURE SIMULATION] Downtime started at: {failure_time}")
-            
-            cur = db.connection.cursor()
+        db_target = DatabaseConnection(NODE_CONFIGS[node_name])
+        failure_time = None
+        if db_target.connect():
+            failure_time = get_mysql_now(db_target.connection)
+            cur = db_target.connection.cursor()
             cur.execute(
                 "INSERT INTO recovery_log (node, downtime_start, status) VALUES (%s, %s, 'FAILED')",
                 (to_log_node_name(node_name), failure_time)
             )
-            db.connection.commit()
+            db_target.connection.commit()
             cur.close()
-            db.close()
+            db_target.close()
         else:
-            # Fallback if can't connect
-            st.session_state.node_status[node_name] = False
-            st.session_state.simulated_failures[node_name] = datetime.now()
+            # fallback to central to record the failure time
+            db_central = DatabaseConnection(NODE_CONFIGS["Central Node"])
+            if db_central.connect():
+                failure_time = get_mysql_now(db_central.connection)
+                cur = db_central.connection.cursor()
+                cur.execute(
+                    "INSERT INTO recovery_log (node, downtime_start, status) VALUES (%s, %s, 'FAILED')",
+                    (to_log_node_name(node_name), failure_time)
+                )
+                db_central.connection.commit()
+                cur.close()
+                db_central.close()
+        if failure_time is None:
+            failure_time = datetime.now()
+        # Store in session state
+        st.session_state.node_status[node_name] = False
+        st.session_state.simulated_failures[node_name] = failure_time
+        print(f"[FAILURE SIMULATION] Downtime started at: {failure_time}")
     except Exception as e:
         print(f"[FAILURE SIMULATION] Exception: {e}")
         st.warning(f"Failed to log failure for {node_name}: {e}")
@@ -1276,10 +1307,6 @@ def simulate_node_recovery(node_name):
     st.session_state.node_status[node_name] = True
     print(f"[RECOVERY] Session state updated: node_status[{node_name}] = True")
     
-    # TODO (jeff): Add recovery logic
-    # 1. Get all missed transactions while node was down
-    # 2. Replay them in order
-    # 3. Handle any conflicts
     if node_name not in st.session_state.simulated_failures:
         print(f"[RECOVERY] {node_name} was never marked as failed")
         st.warning(f"{node_name} was never marked as failed; cannot simulate recovery")
@@ -1302,6 +1329,7 @@ def simulate_node_recovery(node_name):
         print(f"[RECOVERY] Path A: Recovering Central Node from slave nodes")
         source_nodes = ["Node 2", "Node 3"]
         replayed_count = 0
+        total_failed = 0
 
         for src in source_nodes:
             print(f"\n[RECOVERY] Checking {src} for FAILED replications...")
@@ -1334,6 +1362,7 @@ def simulate_node_recovery(node_name):
             failed_reps = curr.fetchall()
             curr.close()
             print(f"[RECOVERY] Found {len(failed_reps)} FAILED replications from {src}")
+            total_failed += len(failed_reps)
             
             # Replay Each missed transaction on Central Node
             for rep in failed_reps:
@@ -1376,6 +1405,15 @@ def simulate_node_recovery(node_name):
                     result = db_central.execute_query(query, params=params, fetch=False)
                     if not (isinstance(result, dict) and result.get("error")):
                         replayed_count += 1
+                        log_transaction_event(
+                            node_name="Central Node",
+                            trans_id=trans_id,
+                            op_type=rep.get("op_type", "UNKNOWN"),
+                            pk_value=str(trans_id),
+                            old_amount=rep.get("old_amount"),
+                            new_amount=rep.get("new_amount"),
+                            status="COMMITTED"
+                        )
                         print(f"[RECOVERY]   Successfully replayed trans_id {rep['trans_id']}")
                         # Mark as REPLAYED in replication_log (this prevents re-processing)
                         update_replication_log_status(
@@ -1388,6 +1426,7 @@ def simulate_node_recovery(node_name):
                     print(f"[RECOVERY]   Could not connect to Central Node for replay")
             db_src.close()
             print(f"[RECOVERY] Finished processing {src}")
+        status_val = "SUCCESS" if replayed_count == total_failed and total_failed > 0 else ("PARTIAL" if replayed_count > 0 else "FAILED")
     else:
         print(f"[RECOVERY] Path B: Recovering {node_name} from Central Node")
         db_central = DatabaseConnection(NODE_CONFIGS["Central Node"])
@@ -1421,6 +1460,7 @@ def simulate_node_recovery(node_name):
         curr.close()
         print(f"[RECOVERY] Found {len(failed_reps)} FAILED replications to {node_name}")
         replayed_count = 0
+        total_failed = len(failed_reps)
 
         #Replay each missed transaction on recovered node
         for rep in failed_reps:
@@ -1464,6 +1504,15 @@ def simulate_node_recovery(node_name):
                 result = db_node.execute_query(query, params=params, fetch=False)
                 if not (isinstance(result, dict) and result.get("error")):
                     replayed_count += 1
+                    log_transaction_event(
+                        node_name=node_name,
+                        trans_id=trans_id,
+                        op_type=rep.get("op_type", "UNKNOWN"),
+                        pk_value=str(trans_id),
+                        old_amount=rep.get("old_amount"),
+                        new_amount=rep.get("new_amount"),
+                        status="COMMITTED"
+                    )
                     print(f"[RECOVERY]   Successfully replayed trans_id {rep['trans_id']}")
                     # Mark as REPLAYED in replication_log
                     update_replication_log_status(
@@ -1475,6 +1524,7 @@ def simulate_node_recovery(node_name):
             else:
                 print(f"[RECOVERY]   Could not connect to {node_name} for replay")
         db_central.close()
+        status_val = "SUCCESS" if replayed_count == total_failed and total_failed > 0 else ("PARTIAL" if replayed_count > 0 else "FAILED")
 
     print(f"\n[RECOVERY] Updating recovery_log in database...")
     db = DatabaseConnection(NODE_CONFIGS[node_name])
@@ -1485,16 +1535,25 @@ def simulate_node_recovery(node_name):
             UPDATE recovery_log
             SET downtime_end = NOW(), 
                 replayed_count = %s,
-                status = 'SUCCESS'
+                status = %s
             WHERE node = %s
                 AND status = 'FAILED'
             ORDER BY downtime_start DESC
             LIMIT 1
             """,
-            (replayed_count, to_log_node_name(node_name),)
+            (replayed_count, status_val, to_log_node_name(node_name),)
         )
         db.connection.commit()
-        print(f"[RECOVERY] Updated recovery_log: replayed_count={replayed_count}, status=SUCCESS")
+        if curr.rowcount == 0:
+            curr.execute(
+                """
+                INSERT INTO recovery_log (node, downtime_start, downtime_end, replayed_count, status)
+                VALUES (%s, %s, NOW(), %s, %s)
+                """,
+                (to_log_node_name(node_name), downtime_start, replayed_count, status_val)
+            )
+            db.connection.commit()
+        print(f"[RECOVERY] Updated recovery_log: replayed_count={replayed_count}, status={status_val}")
         curr.close()
         db.close()
     else:
@@ -1506,7 +1565,7 @@ def simulate_node_recovery(node_name):
         "node": node_name,
         "downtime": str(downtime_end - downtime_start),
         "missed_transactions": replayed_count,
-        "status": "SUCCESS"
+        "status": status_val
     }
     st.session_state.recovery_log.append(recovery_log)
     del st.session_state.simulated_failures[node_name]
@@ -1853,11 +1912,10 @@ def test_node_recovery_missed_writes():
 
 # UTILITY FUNCTIONS 
 def check_node_health(node_name):
-    # Check simulated status first
+    # If simulated offline, return False immediately
     if not st.session_state.node_status.get(node_name, True):
         return False
-    
-    # Then check actual database connection
+    # Otherwise, try a real connection
     db = DatabaseConnection(NODE_CONFIGS[node_name])
     status = db.connect()
     db.close()
@@ -2050,7 +2108,6 @@ with tab3:
             test_node_recovery_missed_writes()
         
         st.success("Recovery test completed! Check logs.")
-        st.rerun()
     
     st.divider()
     st.subheader("Recovery Log")
