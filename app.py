@@ -2714,7 +2714,7 @@ with tab2:
                 st.divider()
                 
                 # ===== SECTION 3: ANOMALY DETECTION MATRIX =====
-                st.subheader("⚠️ Anomaly Detection Matrix")
+                st.subheader("Anomaly Detection Matrix")
                 st.markdown("Shows which anomalies occur at each isolation level:")
                 
                 anomaly_matrix = []
@@ -2725,7 +2725,7 @@ with tab2:
                     anomaly_matrix.append({
                         "Isolation Level": isolation,
                         "Total Anomalies": int(total_anomalies),
-                        "Consistency": "✅ Guaranteed" if total_anomalies == 0 else f"⚠️ {int(total_anomalies)} anomalies detected"
+                        "Consistency": "Guaranteed" if total_anomalies == 0 else f" {int(total_anomalies)} anomalies detected"
                     })
                 
                 anomaly_df = pd.DataFrame(anomaly_matrix)
@@ -2758,7 +2758,7 @@ with tab2:
                 st.divider()
                 
                 # ===== SECTION 5: RECOMMENDATION =====
-                st.subheader("💡 Analysis & Recommendation")
+                st.subheader("Analysis & Recommendation")
                 
                 # Find best isolation levels
                 try:
@@ -2808,86 +2808,7 @@ with tab2:
                     Test Cases: {len(selected_test_cases)}
                     """)
                 
-                st.markdown("### Key Findings")
-                
-                st.markdown("""
-                **Isolation Level Behavior:**
-                
-                1. **READ UNCOMMITTED** 
-                   - Lowest consistency, highest throughput
-                   - May allow dirty reads, non-repeatable reads, lost updates
-                   - Use only for non-critical data
-                
-                2. **READ COMMITTED** 
-                   - Default for most systems
-                   - Prevents dirty reads
-                   - May allow non-repeatable reads and lost updates
-                   - Good balance of consistency and performance
-                
-                3. **REPEATABLE READ** 
-                   - Strong consistency
-                   - Prevents dirty and non-repeatable reads
-                   - May allow phantom reads
-                   - MySQL InnoDB default
-                
-                4. **SERIALIZABLE** 
-                   - Strongest consistency
-                   - Prevents all anomalies (dirty reads, non-repeatable reads, lost updates)
-                   - Lowest throughput (most locking overhead)
-                   - Use for critical operations
-                """)
-                
-                st.markdown("### Production Recommendation:")
-                
-                if best_consistency['Anomalies'] == '0':
-                    st.success(f"""
-                    ✅ **Use {best_consistency['Isolation Level']} for Production**
-                    
-                    This isolation level:
-                    - ✅ Prevents all detected anomalies
-                    - ✅ Provides strong consistency guarantees
-                    - ✅ Success rate: {best_consistency['Success Rate']}
-                    - ✅ Average response time: {best_consistency['Avg Duration (s)']}s
-                    
-                    **Justification:** Zero anomalies detected across all test cases, ensuring data integrity and consistency.
-                    """)
-                else:
-                    st.warning(f"""
-                    **⚖️ Isolation Levels Trade-off Analysis**
-                    
-                    **For Maximum Consistency (Recommended):**
-                    - Use {best_consistency['Isolation Level']}
-                    - Anomalies detected: {best_consistency['Anomalies']}
-                    - Success rate: {best_consistency['Success Rate']}
-                    - Best for: Financial transactions, critical data
-                    
-                    **For Best Performance/Throughput:**
-                    - Use {best_success['Isolation Level']}
-                    - Success rate: {best_success['Success Rate']}
-                    - Anomalies: {best_success['Anomalies']}
-                    - Best for: Reporting, analytics, non-critical reads
-                    
-                    **Balanced Recommendation:**
-                    - Use READ COMMITTED for most application needs
-                    - Provides good consistency with reasonable performance
-                    - Prevents dirty reads but allows some anomalies
-                    """)
-                
                 st.divider()
-                
-                # ===== EXPORT =====
-                st.subheader("📥 Export Results")
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    csv_data = results_df.to_csv(index=False)
-                    st.download_button(
-                        label="📊 Download Detailed Results (CSV)",
-                        data=csv_data,
-                        file_name=f"concurrency_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                        mime="text/csv"
-                    )
                 
                 with col2:
                     summary_report = f"""
@@ -2932,13 +2853,6 @@ with tab2:
                         End of Report
                         {'='*80}
                     """
-                    
-                    st.download_button(
-                        label="📄 Download Report (TXT)",
-                        data=summary_report,
-                        file_name=f"concurrency_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                        mime="text/plain"
-                    )
 
 # TAB 3: FAILURE RECOVERY TESTING ==============================
 with tab3:
