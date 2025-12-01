@@ -54,12 +54,6 @@ NODE_CONFIGS = {
             "user": "user1",
             "password": "UserPass123!",
             "database": "mco2financedata"
-  "Central Node": {
-        "host": "ccscloud.dlsu.edu.ph", # type: ignore # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
-        "port": 60703, # TO RUN LOCAL, change to 60703
-        "user": "user1",
-        "password": "UserPass123!",
-        "database": "mco2financedata"
     },
     "Node 2": {
         "host": "ccscloud.dlsu.edu.ph",  # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
