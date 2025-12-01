@@ -1904,7 +1904,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 with tab1:
     st.header("Current Database State Across All Nodes")
     
-    limit = st.number_input("Row Limit", min_value=1, step=100)
+    limit = st.number_input("Row Limit", min_value=10, step=100)
 
     if st.button("Refresh Data"):
         st.rerun()
