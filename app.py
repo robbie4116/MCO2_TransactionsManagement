@@ -62,15 +62,11 @@ NODE_CONFIGS = {
     "Node 2": {
         "host": "ccscloud.dlsu.edu.ph",  # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
         "port": 60704, # TO RUN LOCAL, change to 60704
-        "host": "ccscloud.dlsu.edu.ph",  # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
-        "port": 60704, # TO RUN LOCAL, change to 60704
         "user": "user1",
         "password": "UserPass123!",
         "database": "mco2financedata"
     },
     "Node 3": {
-        "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
-        "port": 60705, # TO RUN LOCAL, change to 60705
         "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
         "port": 60705, # TO RUN LOCAL, change to 60705
         "user": "user1",
@@ -1911,11 +1907,11 @@ with tab1:
     limit = st.number_input("Row Limit", min_value=1, step=100)
 
     if st.button("Refresh Data"):
-        st.experimental_rerun()
+        st.rerun()
         
     st.subheader("Central Node")
     try:
-        central_data = get_table_data("Central Node", "trans", limit)
+        central_data = get_table_data("Node 2", "trans", limit)
         st.dataframe(central_data, use_container_width=True, height=400)
     except Exception as e:
         st.error(f"Error fetching Central Node data: {e}")
@@ -1923,7 +1919,7 @@ with tab1:
     # Node 2
     st.subheader("Node 2")
     try:
-        node2_data = get_table_data("Central Node", "trans", limit)
+        node2_data = get_table_data("Node 3", "trans", limit)
         st.dataframe(node2_data, use_container_width=True, height=400)
     except Exception as e:
         st.error(f"Error fetching Node 2 data: {e}")
