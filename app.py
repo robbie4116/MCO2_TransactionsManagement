@@ -107,6 +107,10 @@ class DatabaseConnection:
     def connect(self):
         try:
             self.connection = mysql.connector.connect(**self.config)
+            # Set timezone to Manila for this connection
+            cursor = self.connection.cursor()
+            cursor.execute("SET time_zone = '+08:00'")
+            cursor.close()
             return True
         except Error as e:
             st.error(f"Connection failed: {e}")
@@ -198,6 +202,12 @@ def parse_year_from_date(value):
     except Exception:
         return None
 
+def get_mysql_now(connection):
+    cursor = connection.cursor()
+    cursor.execute("SELECT NOW() as server_time")
+    result = cursor.fetchone()
+    cursor.close()
+    return result[0] if result else datetime.now()
 
 def to_log_node_name(node_name):
     """Fit node names into VARCHAR(10) columns for logs."""
@@ -1219,42 +1229,37 @@ def log_write_operation(node, query, params, transaction_id):
     pass
 
 def simulate_node_failure(node_name):
-    """
-    Simulate a node going offline
-    
-    TODO (jeff): Set flag to reject connections to this node
-    This will be used to test Cases #1 and #3 (replication failures)
-    """
     print(f"\n{'='*60}")
     print(f"[FAILURE SIMULATION] Starting failure simulation for {node_name}")
     print(f"{'='*60}")
     
-    st.session_state.node_status[node_name] = False
-    st.session_state.simulated_failures[node_name] = datetime.now()
-    print(f"[FAILURE SIMULATION] Session state updated: node_status[{node_name}] = False")
-    print(f"[FAILURE SIMULATION] Downtime started at: {st.session_state.simulated_failures[node_name]}")
-    
     try: 
-        # Always log to Central Node database
+        # Get timestamp from MySQL to ensure consistency
         db = DatabaseConnection(NODE_CONFIGS["Central Node"])
         if db.connect():
-            print(f"[FAILURE SIMULATION] Connected to Central Node for logging")
-            cur=db.connection.cursor()
+            failure_time = get_mysql_now(db.connection)
+            
+            # Store in session state
+            st.session_state.node_status[node_name] = False
+            st.session_state.simulated_failures[node_name] = failure_time
+            
+            print(f"[FAILURE SIMULATION] Downtime started at: {failure_time}")
+            
+            cur = db.connection.cursor()
             cur.execute(
-                "INSERT INTO recovery_log (node, downtime_start, status) VALUES (%s, NOW(), 'FAILED')",
-                (to_log_node_name(node_name),)
+                "INSERT INTO recovery_log (node, downtime_start, status) VALUES (%s, %s, 'FAILED')",
+                (to_log_node_name(node_name), failure_time)
             )
             db.connection.commit()
-            print(f"[FAILURE SIMULATION] Recovery log entry created: node={to_log_node_name(node_name)}, status=FAILED")
             cur.close()
             db.close()
         else:
-            print(f"[FAILURE SIMULATION] Failed to connect to Central Node for logging")
+            # Fallback if can't connect
+            st.session_state.node_status[node_name] = False
+            st.session_state.simulated_failures[node_name] = datetime.now()
     except Exception as e:
-        print(f"[FAILURE SIMULATION] Exception during logging: {e}")
+        print(f"[FAILURE SIMULATION] Exception: {e}")
         st.warning(f"Failed to log failure for {node_name}: {e}")
-    
-    print(f"[FAILURE SIMULATION] {node_name} is now OFFLINE\n")
 
 def simulate_node_recovery(node_name):
     """
@@ -1284,7 +1289,15 @@ def simulate_node_recovery(node_name):
         st.warning(f"{node_name} was never marked as failed; cannot simulate recovery")
         return 
     downtime_start = st.session_state.simulated_failures[node_name]
-    downtime_end = datetime.now()
+
+    # Get downtime_end from MySQL for consistency
+    db_temp = DatabaseConnection(NODE_CONFIGS["Central Node"])
+    if db_temp.connect():
+        downtime_end = get_mysql_now(db_temp.connection)
+        db_temp.close()
+    else:
+        downtime_end = datetime.now()  # fallback
+
     downtime_duration = downtime_end - downtime_start
     print(f"[RECOVERY] Downtime window: {downtime_start} to {downtime_end}")
     print(f"[RECOVERY] Total downtime duration: {downtime_duration}")
@@ -1316,10 +1329,11 @@ def simulate_node_recovery(node_name):
                 SELECT log_id, trans_id, op_type, old_amount, new_amount, created_at
                 FROM replication_log
                 WHERE target_node = %s
-                AND status IN ('FAILED')
+                AND created_at >= %s
+                AND status = 'FAILED'
                 ORDER BY created_at ASC
                 """,
-                (to_log_node_name("Central Node"),)
+                (to_log_node_name("Central Node"), downtime_start)
             )
             failed_reps = curr.fetchall()
             curr.close()
@@ -1401,10 +1415,11 @@ def simulate_node_recovery(node_name):
             SELECT log_id, trans_id, op_type, old_amount, new_amount, created_at
             FROM replication_log
             WHERE target_node = %s
-            AND status IN ('FAILED')
+            AND created_at >= %s
+            AND status = 'FAILED'
             ORDER BY created_at ASC
             """,
-            (to_log_node_name(node_name),)
+            (to_log_node_name(node_name), downtime_start)
         )
         failed_reps = curr.fetchall()
         curr.close()
@@ -1872,25 +1887,6 @@ with st.sidebar:
             st.error(f"❌ {node_name} (Offline)")
 
     st.divider()
-    st.header("Node Failure / Recovery Simulation")
-
-    node_to_simulate = st.selectbox("Select Node", list(NODE_CONFIGS.keys()), key="simulate_node")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if st.button("Simulate Failure"):
-            simulate_node_failure(node_to_simulate)
-            st.warning(f"{node_to_simulate} failure simulated")
-            st.rerun()  # Refresh UI to show updated node status
-            
-    with col2:
-        if st.button("Simulate Recovery"):
-            simulate_node_recovery(node_to_simulate)
-            st.success(f"{node_to_simulate} recovery initiated")
-            st.rerun()  # Refresh UI to show updated node status
-
-    st.divider()
     st.header("Quick Actions")
     
     if st.button("Clear All Logs"):
@@ -2050,7 +2046,7 @@ with tab3:
             test_node_recovery_missed_writes()
         
         st.success("Recovery test completed! Check logs.")
-        st.rerun()  # Force UI refresh to show updated logs and node status
+        st.rerun()
     
     st.divider()
     st.subheader("Recovery Log")
