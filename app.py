@@ -62,15 +62,11 @@ NODE_CONFIGS = {
     "Node 2": {
         "host": "ccscloud.dlsu.edu.ph",  # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
         "port": 60704, # TO RUN LOCAL, change to 60704
-        "host": "ccscloud.dlsu.edu.ph",  # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
-        "port": 60704, # TO RUN LOCAL, change to 60704
         "user": "user1",
         "password": "UserPass123!",
         "database": "mco2financedata"
     },
     "Node 3": {
-        "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
-        "port": 60705, # TO RUN LOCAL, change to 60705
         "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
         "port": 60705, # TO RUN LOCAL, change to 60705
         "user": "user1",
@@ -107,87 +103,99 @@ class DatabaseConnection:
     def connect(self):
         try:
             self.connection = mysql.connector.connect(**self.config)
-            # Set timezone to Manila for this connection
-            cursor = self.connection.cursor()
-            cursor.execute("SET time_zone = '+08:00'")
-            cursor.close()
             return True
         except Error as e:
             st.error(f"Connection failed: {e}")
             return False
     
-    def execute_query(self, query, params=None, fetch=True, isolation_level=None):
-        # TODO thara: concurrency control
-        # TODO jeff: add transaction logging here
+    def execute_query(self, query, params=None, fetch=True, isolation_level=None, max_retries=3):
+        """Execute query with transaction management and deadlock retry logic"""
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                if not self.connection or not self.connection.is_connected():
+                    if not self.connect():
+                        return None
 
-        try:
-            if not self.connection or not self.connection.is_connected():
-                if not self.connect():
-                    return None
+                if isolation_level:
+                    set_isolation_level(self.connection, isolation_level, per_transaction=True)
 
-            # If caller requested a per-transaction isolation level, apply it on the connection
-            if isolation_level:
-                set_isolation_level(self.connection, isolation_level, per_transaction=True)
+                self.cursor = self.connection.cursor(dictionary=True)
+                self.connection.start_transaction()
 
-            self.cursor = self.connection.cursor(dictionary=True)
+                # Handle multi-statement queries
+                if ";" in query and query.strip().count(";") >= 1:
+                    results = []
+                    last_rowcount = 0
+                    
+                    for result_cursor in self.cursor.execute(query, params or (), multi=True):
+                        try:
+                            if fetch and getattr(result_cursor, "with_rows", False):
+                                rows = result_cursor.fetchall()
+                                if rows:
+                                    results.extend(rows)
+                        except Exception:
+                            pass
+                        try:
+                            last_rowcount = result_cursor.rowcount
+                        except Exception:
+                            last_rowcount = getattr(self.cursor, "rowcount", 0)
 
-            # Handle multi-statement queries (e.g., "UPDATE ...; SELECT SLEEP(2);")
-            # mysql-connector's cursor.execute(..., multi=True) yields a cursor for each statement.
-            if ";" in query and query.strip().count(";") >= 1:
-                results = []
-                last_rowcount = 0
-                # Execute each statement in order and collect SELECT results if requested
-                for result_cursor in self.cursor.execute(query, params or (), multi=True):
-                    try:
-                        if fetch and getattr(result_cursor, "with_rows", False):
-                            rows = result_cursor.fetchall()
-                            if rows:
-                                results.extend(rows)
-                    except Exception:
-                        # ignore fetch errors for statements that don't return rows
-                        pass
-                    try:
-                        last_rowcount = result_cursor.rowcount
-                    except Exception:
-                        last_rowcount = getattr(self.cursor, "rowcount", 0)
-
-                # Commit after multi-statement execution
-                try:
                     self.connection.commit()
-                except Exception:
-                    pass
 
-                if fetch:
-                    return results
+                    if fetch:
+                        return results
+                    else:
+                        return {"affected_rows": last_rowcount}
+
+                # Single statement case
+                self.cursor.execute(query, params or ())
+
+                if fetch and query.strip().upper().startswith('SELECT'):
+                    result = self.cursor.fetchall()
+                    self.connection.commit()
+                    return result
                 else:
-                    return {"affected_rows": last_rowcount}
+                    self.connection.commit()
+                    return {"affected_rows": self.cursor.rowcount}
 
-            # Single statement case
-            self.cursor.execute(query, params or ())
-
-            if fetch and query.strip().upper().startswith('SELECT'):
-                result = self.cursor.fetchall()
-                return result
-            else:
-                # write operation
-                self.connection.commit()
-                return {"affected_rows": self.cursor.rowcount}
-
-        except Error as e:
-            if self.connection:
+            except Error as e:
+                error_str = str(e).lower()
+                
+                # Check for deadlock (MySQL error 1213)
+                if "1213" in str(e) or "deadlock" in error_str:
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        print(f"[DEADLOCK] Retry {retry_count}/{max_retries}")
+                        try:
+                            self.connection.rollback()
+                        except Exception:
+                            pass
+                        time.sleep(0.1 * retry_count)  # Exponential backoff
+                        continue  # ✅ FIXED: Properly indented
+                
+                # Other errors
                 try:
                     self.connection.rollback()
                 except Exception:
                     pass
-            return {"error": str(e)}
-         # TODO (jeff): add connection retry logic for failure scenarios
-
-
+                return {"error": str(e)}
+        
+        return {"error": "Max retries exceeded due to deadlocks"}
+    
     def close(self):
+        """Close database connection and cursor"""
         if self.cursor:
-            self.cursor.close()
+            try:
+                self.cursor.close()
+            except Exception:
+                pass
         if self.connection and self.connection.is_connected():
-            self.connection.close()
+            try:
+                self.connection.close()
+            except Exception:
+                pass
 
 
 # LOGGING & REPLICATION HELPERS ==============================
@@ -203,8 +211,9 @@ def parse_year_from_date(value):
         return None
 
 def get_mysql_now(connection):
+
     cursor = connection.cursor()
-    cursor.execute("SELECT NOW() as server_time")
+    cursor.execute("SELECT NOW() as server_time")  # Changed from current_time to server_time
     result = cursor.fetchone()
     cursor.close()
     return result[0] if result else datetime.now()
@@ -221,6 +230,81 @@ def to_log_node_name(node_name):
     if node_name in mapping:
         return mapping[node_name]
     return str(node_name)[:10]
+
+# NEW SHARED STATE FUNCTIONS ==============================
+def get_node_status(node_name):
+    """
+    Fetch node status from database (shared across all users).
+    Returns True if ONLINE, False if OFFLINE.
+    """
+    try:
+        db = DatabaseConnection(NODE_CONFIGS["Central Node"])
+        if not db.connect():
+            # If can't connect to Central, assume node is online (safe default)
+            return True
+        
+        cur = db.connection.cursor(dictionary=True)
+        
+        # Map full node names to log format
+        log_name = to_log_node_name(node_name)
+        
+        cur.execute("SELECT status FROM node_status WHERE node_name = %s", (log_name,))
+        result = cur.fetchone()
+        cur.close()
+        db.close()
+        
+        if result:
+            return result['status'] == 'ONLINE'
+        else:
+            # If not found in table, assume ONLINE
+            return True
+    except Exception as e:
+        print(f"[ERROR] get_node_status({node_name}): {e}")
+        return True  # Safe default
+
+
+def set_node_status(node_name, status):
+    """
+    Update node status in database (shared across all users).
+    Status should be 'ONLINE' or 'OFFLINE'.
+    """
+    try:
+        db = DatabaseConnection(NODE_CONFIGS["Central Node"])
+        if not db.connect():
+            return False
+        
+        cur = db.connection.cursor()
+        log_name = to_log_node_name(node_name)
+        
+        # Use INSERT ... ON DUPLICATE KEY to ensure record exists
+        cur.execute(
+            """
+            INSERT INTO node_status (node_name, status, updated_at)
+            VALUES (%s, %s, NOW())
+            ON DUPLICATE KEY UPDATE 
+                status = %s,
+                updated_at = NOW()
+            """,
+            (log_name, status, status)
+        )
+        db.connection.commit()
+        cur.close()
+        db.close()
+        return True
+    except Exception as e:
+        print(f"[ERROR] set_node_status({node_name}, {status}): {e}")
+        return False
+
+
+def sync_node_status_to_session():
+    """
+    Sync database node_status to session_state for UI responsiveness.
+    Call this at the beginning of each page load.
+    """
+    for node_name in NODE_CONFIGS.keys():
+        db_status = get_node_status(node_name)
+        st.session_state.node_status[node_name] = db_status
+
 def choose_target_nodes_by_year(date_value):
     """
     Decide which fragment nodes should store the row based on newdate.
@@ -736,6 +820,11 @@ def test_concurrent_reads(isolation_level):
         "results": results
     })
 
+    st.success(f"✅ Test completed - Consistency: {consistent}")
+    if not consistent:
+        st.error("❌ Inconsistent reads detected!")
+    with st.expander("View Full Results"):
+        st.json(results)
 
 def test_read_write_conflict(isolation_level):
     """
@@ -902,6 +991,16 @@ def test_read_write_conflict(isolation_level):
         "params": (trans_id,),
         "test_summary": summary
     })
+
+    if dirty_read:
+        st.error(f"❌ Dirty read detected!")
+    elif non_repeatable:
+        st.warning(f"⚠️ Non-repeatable read detected")
+    else:
+        st.success(f"✅ No anomalies detected")
+    
+    with st.expander("View Test Summary"):
+        st.json(summary)
 
 
 def test_write_write_conflict(isolation_level):
@@ -1082,19 +1181,20 @@ def test_write_write_conflict(isolation_level):
         "test_summary": summary
     })
 
-
+    if lost_update:
+        st.error(f"❌ Lost update detected!")
+    else:
+        st.success(f"✅ No lost updates")
+    
+    with st.expander("View Test Summary"):
+        st.json(summary)
 
 # REPLICATION MODULE ==============================
 # TODO (jeff): Implement all functions in this section
 def replicate_to_central(source_node, query, params, trans_id=None, op_type=None, pk_value=None, old_amount=None, new_amount=None):
     """
-    Replicate a write operation from Node 2/3 to Central Node
-    
-    Steps:
-    1. Log PENDING replication attempt
-    2. Execute the write on Central Node
-    3. Update replication_log with SUCCESS/FAILED
-    4. Return success flag and error (if any)
+    Replicate a write operation from Node 2/3 to Central Node.
+    Checks SHARED database status, not session state.
     """
     print(f"[REPLICATION] Attempting to replicate trans_id {trans_id} from {source_node} to Central Node")
     
@@ -1111,10 +1211,11 @@ def replicate_to_central(source_node, query, params, trans_id=None, op_type=None
 
     success = False
     error_msg = None
+    db = None
     try:
-        # Check if Central Node is in simulated failure state
-        if not st.session_state.node_status.get("Central Node", True):
-            raise Exception("Central Node is offline (simulated failure)")
+        # CHECK DATABASE NODE STATUS (SHARED across all users)
+        if not get_node_status("Central Node"):
+            raise Exception("Central Node is offline (from database)")
         
         db = DatabaseConnection(NODE_CONFIGS["Central Node"])
         if not db.connect():
@@ -1123,7 +1224,6 @@ def replicate_to_central(source_node, query, params, trans_id=None, op_type=None
         if isinstance(res, dict) and res.get("error"):
             raise Exception(res.get("error"))
         success = True
-        # Log on target (Central) for the applied write
         log_transaction_event(
             node_name="Central Node",
             trans_id=trans_id,
@@ -1146,22 +1246,18 @@ def replicate_to_central(source_node, query, params, trans_id=None, op_type=None
             )
             print(f"[REPLICATION] Updated replication_log[{log_id}] with status: {'SUCCESS' if success else 'FAILED'}")
         else:
-            st.warning(f"No replication_log row created for trans {trans_id} from {source_node}; replication {'succeeded' if success else 'failed'}")
-        try:
-            db.close()
-        except Exception:
-            pass
+            st.warning(f"No replication_log row created for trans {trans_id} from {source_node}")
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
     return success, error_msg
 
 def replicate_from_central(target_node, query, params, trans_id=None, op_type=None, pk_value=None, old_amount=None, new_amount=None):
     """
-    Replicate a write operation from Central Node to Node 2/3
-    
-    Steps:
-    1. Log PENDING replication attempt
-    2. Execute the write on target node
-    3. Update replication_log with SUCCESS/FAILED
-    4. Return success flag and error (if any)
+    Replicate a write operation from Central Node to Node 2/3.
+    Checks SHARED database status, not session state.
     """
     log_id = insert_replication_log(
         source_node="Central Node",
@@ -1174,10 +1270,11 @@ def replicate_from_central(target_node, query, params, trans_id=None, op_type=No
 
     success = False
     error_msg = None
+    db = None
     try:
-        # Check if target node is in simulated failure state
-        if not st.session_state.node_status.get(target_node, True):
-            raise Exception(f"{target_node} is offline (simulated failure)")
+        # CHECK DATABASE NODE STATUS (SHARED across all users)
+        if not get_node_status(target_node):
+            raise Exception(f"{target_node} is offline (from database)")
         
         db = DatabaseConnection(NODE_CONFIGS[target_node])
         if not db.connect():
@@ -1186,7 +1283,6 @@ def replicate_from_central(target_node, query, params, trans_id=None, op_type=No
         if isinstance(res, dict) and res.get("error"):
             raise Exception(res.get("error"))
         success = True
-        # Log on target node for the applied write
         log_transaction_event(
             node_name=target_node,
             trans_id=trans_id,
@@ -1207,11 +1303,12 @@ def replicate_from_central(target_node, query, params, trans_id=None, op_type=No
                 error_message=error_msg,
             )
         else:
-            st.warning(f"No replication_log row created for trans {trans_id} from Central to {target_node}; replication {'succeeded' if success else 'failed'}")
-        try:
-            db.close()
-        except Exception:
-            pass
+            st.warning(f"No replication_log row created for trans {trans_id} from Central to {target_node}")
+        if db:
+            try:
+                db.close()
+            except Exception:
+                pass
     return success, error_msg
 
 # RECOVERY MODULE ==============================
@@ -1229,65 +1326,71 @@ def log_write_operation(node, query, params, transaction_id):
     pass
 
 def simulate_node_failure(node_name):
+    """
+    Simulate node failure (shared across all users via database).
+    """
     print(f"\n{'='*60}")
     print(f"[FAILURE SIMULATION] Starting failure simulation for {node_name}")
     print(f"{'='*60}")
     
-    try: 
-        # Get timestamp from MySQL to ensure consistency
+    try:
+        # 1. Get timestamp from MySQL for consistency
         db = DatabaseConnection(NODE_CONFIGS["Central Node"])
         if db.connect():
             failure_time = get_mysql_now(db.connection)
-            
-            # Store in session state
-            st.session_state.node_status[node_name] = False
-            st.session_state.simulated_failures[node_name] = failure_time
-            
-            print(f"[FAILURE SIMULATION] Downtime started at: {failure_time}")
-            
+        else:
+            failure_time = datetime.now()
+        
+        # 2. Update node_status in database (SHARED across all users)
+        set_node_status(node_name, "OFFLINE")
+        print(f"[FAILURE SIMULATION] Updated database: {node_name} is now OFFLINE")
+        
+        # 3. Also update session state for immediate UI feedback
+        st.session_state.node_status[node_name] = False
+        st.session_state.simulated_failures[node_name] = failure_time
+        
+        print(f"[FAILURE SIMULATION] Downtime started at: {failure_time}")
+        
+        # 4. Log failure in recovery_log
+        if db.connection:
             cur = db.connection.cursor()
             cur.execute(
-                "INSERT INTO recovery_log (node, downtime_start, status) VALUES (%s, %s, 'FAILED')",
+                """
+                INSERT INTO recovery_log (node, downtime_start, status)
+                VALUES (%s, %s, 'FAILED')
+                """,
                 (to_log_node_name(node_name), failure_time)
             )
             db.connection.commit()
             cur.close()
             db.close()
-        else:
-            # Fallback if can't connect
-            st.session_state.node_status[node_name] = False
-            st.session_state.simulated_failures[node_name] = datetime.now()
+            print(f"[FAILURE SIMULATION] Logged failure in recovery_log")
+        
     except Exception as e:
         print(f"[FAILURE SIMULATION] Exception: {e}")
         st.warning(f"Failed to log failure for {node_name}: {e}")
 
 def simulate_node_recovery(node_name):
     """
-    Simulate a node coming back online
-    
-    TODO (jeff): Implement recovery logic for Cases #2 and #4
-    Steps:
-    1. Mark node as available
-    2. Retrieve missed transactions from log
-    3. Replay transactions on recovered node
-    4. Verify data consistency after recovery
-    5. Log recovery process
+    Simulate a node coming back online (shared recovery via database).
     """
     print(f"\n{'='*60}")
     print(f"[RECOVERY] Starting recovery process for {node_name}")
     print(f"{'='*60}")
     
-    st.session_state.node_status[node_name] = True
-    print(f"[RECOVERY] Session state updated: node_status[{node_name}] = True")
+    # 1. Update database to mark node as ONLINE (SHARED)
+    set_node_status(node_name, "ONLINE")
+    print(f"[RECOVERY] Database updated: {node_name} is now ONLINE")
     
-    # TODO (jeff): Add recovery logic
-    # 1. Get all missed transactions while node was down
-    # 2. Replay them in order
-    # 3. Handle any conflicts
+    # 2. Also update session state
+    st.session_state.node_status[node_name] = True
+    print(f"[RECOVERY] Session state updated")
+    
     if node_name not in st.session_state.simulated_failures:
         print(f"[RECOVERY] {node_name} was never marked as failed")
         st.warning(f"{node_name} was never marked as failed; cannot simulate recovery")
         return 
+    
     downtime_start = st.session_state.simulated_failures[node_name]
 
     # Get downtime_end from MySQL for consistency
@@ -1296,7 +1399,7 @@ def simulate_node_recovery(node_name):
         downtime_end = get_mysql_now(db_temp.connection)
         db_temp.close()
     else:
-        downtime_end = datetime.now()  # fallback
+        downtime_end = datetime.now()
 
     downtime_duration = downtime_end - downtime_start
     print(f"[RECOVERY] Downtime window: {downtime_start} to {downtime_end}")
@@ -1313,7 +1416,7 @@ def simulate_node_recovery(node_name):
             if not db_src.connect():
                 print(f"[RECOVERY] Could not connect to {src}, skipping")
                 continue
-            #Query replication_log on source node for FAILED replications to Central during downtime
+            
             curr = db_src.connection.cursor(dictionary=True)
             
             # Debug: Check what's in the replication_log
@@ -1321,9 +1424,7 @@ def simulate_node_recovery(node_name):
             debug_logs = curr.fetchall()
             print(f"[RECOVERY] Recent replication_log entries on {src}: {debug_logs}")
             
-            # Query for FAILED replications - don't use timestamp comparison due to timezone issues
-            # Instead, get all FAILED replications that haven't been replayed yet
-            # Note: Successfully replayed entries are marked as 'REPLAYED' to prevent re-processing
+            # Query for FAILED replications
             curr.execute(
                 """
                 SELECT log_id, trans_id, op_type, old_amount, new_amount, created_at
@@ -1339,7 +1440,7 @@ def simulate_node_recovery(node_name):
             curr.close()
             print(f"[RECOVERY] Found {len(failed_reps)} FAILED replications from {src}")
             
-            # Replay Each missed transaction on Central Node
+            # Replay each missed transaction on Central Node
             for rep in failed_reps:
                 print(f"\n[RECOVERY] Replaying transaction {rep['trans_id']} from {src}...")
                 print(f"[RECOVERY]   - Operation: {rep['op_type']}")
@@ -1348,7 +1449,9 @@ def simulate_node_recovery(node_name):
 
                 row = fetch_trans_row(src, trans_id)
                 if not row:
+                    print(f"[RECOVERY]   Could not fetch row from {src}")
                     continue
+                
                 if rep['op_type'] == 'INSERT':
                     query = """
                     INSERT INTO trans (trans_id, account_id, newdate, type, operation, amount, balance, account)
@@ -1373,6 +1476,7 @@ def simulate_node_recovery(node_name):
                     query = "DELETE FROM trans WHERE trans_id=%s"
                     params = (trans_id,)
                 else:
+                    print(f"[RECOVERY]   Unknown operation type: {rep['op_type']}")
                     continue
 
                 db_central = DatabaseConnection(NODE_CONFIGS["Central Node"])
@@ -1381,7 +1485,7 @@ def simulate_node_recovery(node_name):
                     if not (isinstance(result, dict) and result.get("error")):
                         replayed_count += 1
                         print(f"[RECOVERY]   Successfully replayed trans_id {rep['trans_id']}")
-                        # Mark as REPLAYED in replication_log (this prevents re-processing)
+                        # Mark as REPLAYED in replication_log (prevents re-processing)
                         update_replication_log_status(
                             src, rep['log_id'], "REPLAYED")
                         print(f"[RECOVERY]   Marked replication_log[{rep['log_id']}] as REPLAYED")
@@ -1390,26 +1494,30 @@ def simulate_node_recovery(node_name):
                     db_central.close()
                 else:
                     print(f"[RECOVERY]   Could not connect to Central Node for replay")
+            
             db_src.close()
             print(f"[RECOVERY] Finished processing {src}")
+    
     else:
+        # Recovering Node 2 or Node 3
         print(f"[RECOVERY] Path B: Recovering {node_name} from Central Node")
         db_central = DatabaseConnection(NODE_CONFIGS["Central Node"])
         if not db_central.connect():
             print(f"[RECOVERY] Cannot connect to Central Node for recovery")
             st.warning("Cannot connect to Central Node for recovery")
             return
+        
         print(f"[RECOVERY] Connected to Central Node")
+        
         # Query replication_log on Central Node for FAILED replications to this node during downtime
         curr = db_central.connection.cursor(dictionary=True)
         
-        # Debug: Check what's in the replication_log
+        # Debug
         curr.execute("SELECT log_id, trans_id, target_node, status, created_at FROM replication_log ORDER BY created_at DESC LIMIT 5")
         debug_logs = curr.fetchall()
         print(f"[RECOVERY] Recent replication_log entries on Central Node: {debug_logs}")
         
-        # Query for FAILED replications - don't use timestamp comparison due to timezone issues
-        # Note: Successfully replayed entries are marked as 'REPLAYED' to prevent re-processing
+        # Query for FAILED replications
         curr.execute(
             """
             SELECT log_id, trans_id, op_type, old_amount, new_amount, created_at
@@ -1424,9 +1532,10 @@ def simulate_node_recovery(node_name):
         failed_reps = curr.fetchall()
         curr.close()
         print(f"[RECOVERY] Found {len(failed_reps)} FAILED replications to {node_name}")
+        
         replayed_count = 0
 
-        #Replay each missed transaction on recovered node
+        # Replay each missed transaction on recovered node
         for rep in failed_reps:
             print(f"\n[RECOVERY] Replaying transaction {rep['trans_id']} to {node_name}...")
             print(f"[RECOVERY]   - Operation: {rep['op_type']}")
@@ -1435,9 +1544,10 @@ def simulate_node_recovery(node_name):
 
             row = fetch_trans_row("Central Node", trans_id)
             if not row:
+                print(f"[RECOVERY]   Could not fetch row from Central Node")
                 continue
 
-            #Reconstruct query based on op_type
+            # Reconstruct query based on op_type
             if rep['op_type'] == 'INSERT':
                 query = """
                     INSERT INTO trans(trans_id, account_id, newdate, type, operation, amount, balance, account)
@@ -1462,7 +1572,9 @@ def simulate_node_recovery(node_name):
                 query = "DELETE FROM trans WHERE trans_id=%s"
                 params = (trans_id,)
             else:
+                print(f"[RECOVERY]   Unknown operation type: {rep['op_type']}")
                 continue
+            
             db_node = DatabaseConnection(NODE_CONFIGS[node_name])
             if db_node.connect():
                 result = db_node.execute_query(query, params=params, fetch=False)
@@ -1478,10 +1590,11 @@ def simulate_node_recovery(node_name):
                 db_node.close()
             else:
                 print(f"[RECOVERY]   Could not connect to {node_name} for replay")
+        
         db_central.close()
 
     print(f"\n[RECOVERY] Updating recovery_log in database...")
-    db = DatabaseConnection(NODE_CONFIGS[node_name])
+    db = DatabaseConnection(NODE_CONFIGS["Central Node"])
     if db.connect():
         curr = db.connection.cursor()
         curr.execute(
@@ -1502,13 +1615,13 @@ def simulate_node_recovery(node_name):
         curr.close()
         db.close()
     else:
-        print(f"[RECOVERY] Could not connect to {node_name} to update recovery_log")
+        print(f"[RECOVERY] Could not connect to Central Node to update recovery_log")
 
     # Also add to session state for immediate display
     recovery_log = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
         "node": node_name,
-        "downtime": str(downtime_end - downtime_start),
+        "downtime": str(downtime_duration),
         "missed_transactions": replayed_count,
         "status": "SUCCESS"
     }
@@ -1607,6 +1720,13 @@ def test_central_recovery_missed_writes():
     4. Replay missed transactions
     5. Verify all nodes are consistent
     """
+
+    # Clear any existing test data
+    db_clear = DatabaseConnection(NODE_CONFIGS["Node 2"])
+    if db_clear.connect():
+        db_clear.execute_query("DELETE FROM trans WHERE trans_id = 999992", fetch=False)
+        db_clear.close()
+
     print(f"\n[TEST_CASE_2] ===== STARTING TEST CASE #2 =====")
     
     # 1. Fail Central
@@ -1877,11 +1997,16 @@ def get_table_data(node_name, trans=None, limit=100):
     db.close()
     return result
 
-# Sidebar - Node Status
+# Sidebar - Node Status (NOW USES DATABASE)
 with st.sidebar:
     st.header("Node Status")
+    
+    # Sync database status to session on each load
+    sync_node_status_to_session()
+    
     for node_name in NODE_CONFIGS.keys():
-        if check_node_health(node_name):
+        # Check database first, then actual connection
+        if get_node_status(node_name):
             st.success(f"✅ {node_name}")
         else:
             st.error(f"❌ {node_name} (Offline)")
@@ -1894,6 +2019,9 @@ with st.sidebar:
         st.session_state.replication_log = []
         st.session_state.recovery_log = []
         st.rerun()
+
+# Sync database node status to session state at page load
+sync_node_status_to_session()
 
 # MAIN TABS ==============================
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -1908,10 +2036,10 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 with tab1:
     st.header("Current Database State Across All Nodes")
     
-    limit = st.number_input("Row Limit", min_value=1, step=100)
+    limit = st.number_input("Row Limit", min_value=10, step=100)
 
     if st.button("Refresh Data"):
-        st.experimental_rerun()
+        st.rerun()
         
     st.subheader("Central Node")
     try:
@@ -1923,7 +2051,7 @@ with tab1:
     # Node 2
     st.subheader("Node 2")
     try:
-        node2_data = get_table_data("Central Node", "trans", limit)
+        node2_data = get_table_data("Node 2", "trans", limit)
         st.dataframe(node2_data, use_container_width=True, height=400)
     except Exception as e:
         st.error(f"Error fetching Node 2 data: {e}")
@@ -1931,7 +2059,7 @@ with tab1:
     # Node 3 
     st.subheader("Node 3")
     try:
-        node3_data = get_table_data("Central Node", "trans", limit)
+        node3_data = get_table_data("Node 3", "trans", limit)
         st.dataframe(node3_data, use_container_width=True, height=400)
     except Exception as e:
         st.error(f"Error fetching Node 3 data: {e}")
@@ -1943,146 +2071,397 @@ with tab1:
 with tab2:
     st.header("Concurrency Control Testing")
     
-    # Isolation level selector
-    isolation_level = st.selectbox(
-        "Select Isolation Level",
-        ["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"],
-        key="isolation_level"
-    )
+    # Create subtabs for different test modes
+    concurrency_mode, high_volume_mode = st.tabs(["Single Test", "High Volume Analysis"])
     
-    st.divider()
-    
-    # Test Case Selection
-    test_case = st.radio(
-        "Select Test Case",
-        [
-            "Case #1: Concurrent Reads",
-            "Case #2: Read + Write Conflict",
-            "Case #3: Write + Write Conflict"
-        ]
-    )
-    
-    # TODO (emman): Add input fields for test parameters
-    # - Number of concurrent transactions
-    # - Which nodes to use
-    # - Data to read/write
-    
-    if st.button("Run Concurrency Test"):
-        st.info(f"Running {test_case} with {isolation_level}...")
+    # ===== SINGLE TEST MODE =====
+    with concurrency_mode:
+        st.subheader("Run Individual Test Cases")
         
-        # TODO (thara): Call appropriate test function based on test_case
-        # if test_case == "Case #1: Concurrent Reads":
-        #     test_concurrent_reads(isolation_level)
-        # elif test_case == "Case #2: Read + Write Conflict":
-        #     test_read_write_conflict(isolation_level)
-        # elif test_case == "Case #3: Write + Write Conflict":
-        #     test_write_write_conflict(isolation_level)
-        
-        ## NEW IN THE CODE [THARA]
-        if test_case == "Case #1: Concurrent Reads":
-            test_concurrent_reads(isolation_level)
-        elif test_case == "Case #2: Read + Write Conflict":
-            test_read_write_conflict(isolation_level)
-        elif test_case == "Case #3: Write + Write Conflict":
-            test_write_write_conflict(isolation_level)
-        
-        st.success("Test completed! Check Transaction Logs tab for results.")
-    
-    st.divider()
-    st.subheader("Recent Test Results")
-
-    recent_transactions = st.session_state.get("transaction_log", [])
-    if recent_transactions:
-        df_recent = pd.DataFrame(recent_transactions)
-        # Show only last 10 transactions
-        st.dataframe(df_recent.tail(10), use_container_width=True, height=300)
-    else:
-        st.info("No transactions logged yet...")
-
-# TAB 3: FAILURE RECOVERY TESTING ==============================
-with tab3:
-    st.header("Global Failure Recovery Testing")
-    
-    # Test Case Selection
-    recovery_test_case = st.radio(
-        "Select Recovery Test Case",
-        [
-            "Case #1: Node 2/3 → Central Replication Failure",
-            "Case #2: Central Node Recovery (Missed Writes)",
-            "Case #3: Central → Node 2/3 Replication Failure",
-            "Case #4: Node 2/3 Recovery (Missed Writes)"
-        ]
-    )
-    
-    # TODO (emman): Add controls for:
-    # - Which node to fail/recover
-    # - Number of transactions to execute during failure
-    # - Data to use for testing
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        if st.button("Simulate Node Failure"):
-            # TODO (jeff): call simulate_node_failure() for selected node
-            st.warning("Node failure simulated")
-    
-    with col2:
-        if st.button("Simulate Node Recovery"):
-            # TODO (jeff): call simulate_node_recovery() for selected node
-            st.success("Node recovery initiated")
-    
-    st.divider()
-    
-    if st.button("Run Recovery Test"):
-        st.info(f"Running {recovery_test_case}...")
-        
-        if recovery_test_case == "Case #1: Node 2/3 → Central Replication Failure":
-            test_replication_failure_to_central()
-        elif recovery_test_case == "Case #2: Central Node Recovery (Missed Writes)":
-            test_central_recovery_missed_writes()
-        elif recovery_test_case == "Case #3: Central → Node 2/3 Replication Failure":
-            test_replication_failure_from_central()
-        elif recovery_test_case == "Case #4: Node 2/3 Recovery (Missed Writes)":
-            test_node_recovery_missed_writes()
-        
-        st.success("Recovery test completed! Check logs.")
-        st.rerun()
-    
-    st.divider()
-    st.subheader("Recovery Log")
-    
-    recovery_logs = st.session_state.get("recovery_log", [])
-
-    if recovery_logs:
-        df_recovery = pd.DataFrame(recovery_logs)
-        
-        # Optional filters
-        selected_node = st.selectbox(
-            "Select Node",
-            ["All Nodes"] + list(NODE_CONFIGS.keys()),
-            key="recovery_node_filter"
+        # Isolation level selector
+        isolation_level = st.selectbox(
+            "Select Isolation Level",
+            ["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"],
+            key="isolation_level"
         )
         
-        status_options = ["All", "Recovered", "Pending"]
-        selected_status = st.selectbox(
-            "Select Status",
-            status_options,
-            key="recovery_status_filter"
+        st.divider()
+        
+        # Test Case Selection
+        test_case = st.radio(
+            "Select Test Case",
+            [
+                "Case #1: Concurrent Reads",
+                "Case #2: Read + Write Conflict",
+                "Case #3: Write + Write Conflict"
+            ]
         )
         
-        # Apply filters
-        if selected_node != "All Nodes" and "node" in df_recovery.columns:
-            df_recovery = df_recovery[df_recovery["node"] == selected_node]
+        if st.button("Run Concurrency Test"):
+            st.info(f"Running {test_case} with {isolation_level}...")
+            
+            if test_case == "Case #1: Concurrent Reads":
+                test_concurrent_reads(isolation_level)
+            elif test_case == "Case #2: Read + Write Conflict":
+                test_read_write_conflict(isolation_level)
+            elif test_case == "Case #3: Write + Write Conflict":
+                test_write_write_conflict(isolation_level)
+            
+            st.success("Test completed! Check Transaction Logs tab for results.")
         
-        if selected_status != "All" and "status" in df_recovery.columns:
-            df_recovery = df_recovery[df_recovery["status"].str.lower() == selected_status.lower()]
-        
-        if not df_recovery.empty:
-            st.dataframe(df_recovery, use_container_width=True, height=300)
+        st.divider()
+        st.subheader("Recent Test Results")
+
+        recent_transactions = st.session_state.get("transaction_log", [])
+        if recent_transactions:
+            df_recent = pd.DataFrame(recent_transactions)
+            # Show only last 10 transactions
+            st.dataframe(df_recent.tail(10), use_container_width=True, height=300)
         else:
-            st.info("No recovery logs match the selected filters.")
-    else:
-        st.info("No recovery logs available yet...")
+            st.info("No transactions logged yet...")
+    
+    # ===== HIGH VOLUME TEST MODE =====
+    with high_volume_mode:
+        st.subheader("High Volume Concurrency Analysis")
+        st.markdown("""
+        This mode tests all isolation levels across all three test cases to determine:
+        - Which isolation level supports highest transaction throughput
+        - Transaction success rate per isolation level
+        - Anomalies detected per isolation level
+        - Recommendation for production use
+        """)
+        
+        st.divider()
+        
+        # Configuration
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            num_iterations = st.number_input(
+                "Number of Test Iterations",
+                min_value=1,
+                max_value=5,
+                value=1,
+                help="Run each test case this many times"
+            )
+        
+        with col2:
+            selected_isolation_levels = st.multiselect(
+                "Select Isolation Levels to Test",
+                ["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"],
+                default=["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"],
+                help="Which isolation levels to compare"
+            )
+        
+        with col3:
+            selected_test_cases = st.multiselect(
+                "Select Test Cases to Run",
+                ["Case #1: Concurrent Reads", "Case #2: Read + Write Conflict", "Case #3: Write + Write Conflict"],
+                default=["Case #1: Concurrent Reads", "Case #2: Read + Write Conflict", "Case #3: Write + Write Conflict"],
+                help="Which test cases to include"
+            )
+        
+        st.divider()
+        
+        if st.button("Run High Volume Analysis", key="run_high_volume"):
+            st.info(f"Starting high volume analysis...\nIsolation Levels: {len(selected_isolation_levels)}\nTest Cases: {len(selected_test_cases)}\nIterations: {num_iterations}")
+            
+            # Initialize results container
+            high_volume_results = {
+                "isolation_level": [],
+                "test_case": [],
+                "iteration": [],
+                "success_count": [],
+                "failed_count": [],
+                "anomalies": [],
+                "duration": [],
+                "throughput": []
+            }
+            
+            # Progress tracking
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            total_tests = len(selected_isolation_levels) * len(selected_test_cases) * num_iterations
+            current_test = 0
+            
+            # Run all tests
+            for isolation in selected_isolation_levels:
+                for test_case in selected_test_cases:
+                    for iteration in range(num_iterations):
+                        current_test += 1
+                        progress = current_test / total_tests
+                        progress_bar.progress(progress)
+                        status_text.text(f"Running: {isolation} | {test_case} | Iteration {iteration + 1}/{num_iterations}")
+                        
+                        # Record start time
+                        start_time = time.time()
+                        start_log_count = len(st.session_state.transaction_log)
+                        
+                        # Run the test
+                        if test_case == "Case #1: Concurrent Reads":
+                            test_concurrent_reads(isolation)
+                        elif test_case == "Case #2: Read + Write Conflict":
+                            test_read_write_conflict(isolation)
+                        elif test_case == "Case #3: Write + Write Conflict":
+                            test_write_write_conflict(isolation)
+                        
+                        # Record end time
+                        end_time = time.time()
+                        duration = end_time - start_time
+                        
+                        # Count transactions in this test
+                        end_log_count = len(st.session_state.transaction_log)
+                        transactions_in_test = end_log_count - start_log_count
+                        
+                        # Calculate throughput (transactions per second)
+                        throughput = transactions_in_test / duration if duration > 0 else 0
+                        
+                        # Count successes/failures
+                        recent_logs = st.session_state.transaction_log[start_log_count:end_log_count]
+                        success_count = sum(1 for log in recent_logs if log.get("status") == "success" or log.get("status") == "PASS")
+                        failed_count = sum(1 for log in recent_logs if log.get("status") == "error" or log.get("status") == "FAIL")
+                        
+                        # Detect anomalies from test summary
+                        anomaly_count = 0
+                        for log in recent_logs:
+                            if log.get("test_summary"):
+                                summary = log.get("test_summary", {})
+                                if summary.get("dirty_read") or summary.get("non_repeatable_read") or summary.get("lost_update"):
+                                    anomaly_count += 1
+                        
+                        # Store results
+                        high_volume_results["isolation_level"].append(isolation)
+                        high_volume_results["test_case"].append(test_case)
+                        high_volume_results["iteration"].append(iteration + 1)
+                        high_volume_results["success_count"].append(success_count)
+                        high_volume_results["failed_count"].append(failed_count)
+                        high_volume_results["anomalies"].append(anomaly_count)
+                        high_volume_results["duration"].append(f"{duration:.2f}s")
+                        high_volume_results["throughput"].append(f"{throughput:.2f} txn/s")
+            
+            progress_bar.progress(1.0)
+            status_text.text("Analysis complete!")
+            
+            # ===== DISPLAY RESULTS =====
+            st.success("High Volume Analysis Complete!")
+            st.divider()
+            
+            # Create results dataframe
+            results_df = pd.DataFrame(high_volume_results)
+            
+            # Display raw results
+            st.subheader("Detailed Test Results")
+            st.dataframe(results_df, use_container_width=True)
+            
+            st.divider()
+            
+            # ===== ANALYSIS & COMPARISON =====
+            st.subheader("Isolation Level Comparison")
+            
+            # Aggregate by isolation level
+            comparison_data = []
+            for isolation in selected_isolation_levels:
+                isolation_logs = results_df[results_df["isolation_level"] == isolation]
+                
+                total_success = isolation_logs["success_count"].sum()
+                total_failed = isolation_logs["failed_count"].sum()
+                total_anomalies = isolation_logs["anomalies"].sum()
+                total_throughput = sum(
+                    float(str(tps).split()[0]) 
+                    for tps in isolation_logs["throughput"] 
+                    if str(tps).split()[0].replace(".", "").isdigit()
+                )
+                avg_duration = sum(
+                    float(str(dur).rstrip("s")) 
+                    for dur in isolation_logs["duration"] 
+                    if str(dur).rstrip("s").replace(".", "").isdigit()
+                ) / len(isolation_logs) if len(isolation_logs) > 0 else 0
+                
+                success_rate = (total_success / (total_success + total_failed) * 100) if (total_success + total_failed) > 0 else 0
+                
+                comparison_data.append({
+                    "Isolation Level": isolation,
+                    "Total Transactions": total_success + total_failed,
+                    "Successful": total_success,
+                    "Failed": total_failed,
+                    "Success Rate (%)": f"{success_rate:.1f}%",
+                    "Anomalies Detected": total_anomalies,
+                    "Throughput (txn/s)": f"{total_throughput:.2f}",
+                    "Avg Duration (s)": f"{avg_duration:.2f}"
+                })
+            
+            comparison_df = pd.DataFrame(comparison_data)
+            st.dataframe(comparison_df, use_container_width=True, height=300)
+            
+            st.divider()
+            
+            # ===== ANOMALY MATRIX =====
+            st.subheader("Anomaly Detection Matrix")
+            st.markdown("Shows which anomalies occur at each isolation level:")
+            
+            anomaly_matrix = []
+            for isolation in selected_isolation_levels:
+                isolation_logs = results_df[results_df["isolation_level"] == isolation]
+                
+                dirty_reads = sum(1 for log in st.session_state.transaction_log 
+                                 if log.get("test_summary", {}).get("dirty_read") and 
+                                 log.get("isolation_level") == isolation)
+                non_repeatable = sum(1 for log in st.session_state.transaction_log 
+                                    if log.get("test_summary", {}).get("non_repeatable_read") and 
+                                    log.get("isolation_level") == isolation)
+                lost_updates = sum(1 for log in st.session_state.transaction_log 
+                                  if log.get("test_summary", {}).get("lost_update") and 
+                                  log.get("isolation_level") == isolation)
+                
+                anomaly_matrix.append({
+                    "Isolation Level": isolation,
+                    "Dirty Reads": "❌" if dirty_reads == 0 else f"⚠️ {dirty_reads}",
+                    "Non-Repeatable Reads": "❌" if non_repeatable == 0 else f"⚠️ {non_repeatable}",
+                    "Lost Updates": "❌" if lost_updates == 0 else f"⚠️ {lost_updates}",
+                    "Consistency": "✅ Guaranteed" if (dirty_reads + non_repeatable + lost_updates) == 0 else "⚠️ At Risk"
+                })
+            
+            anomaly_df = pd.DataFrame(anomaly_matrix)
+            st.dataframe(anomaly_df, use_container_width=True, height=250)
+            
+            st.divider()
+            
+            # ===== TEST CASE PERFORMANCE =====
+            st.subheader("Performance by Test Case")
+            
+            test_case_perf = []
+            for test_case in selected_test_cases:
+                test_logs = results_df[results_df["test_case"] == test_case]
+                
+                total_success = test_logs["success_count"].sum()
+                total_failed = test_logs["failed_count"].sum()
+                total_throughput = sum(
+                    float(str(tps).split()[0]) 
+                    for tps in test_logs["throughput"] 
+                    if str(tps).split()[0].replace(".", "").isdigit()
+                )
+                success_rate = (total_success / (total_success + total_failed) * 100) if (total_success + total_failed) > 0 else 0
+                
+                test_case_perf.append({
+                    "Test Case": test_case,
+                    "Total Runs": len(test_logs),
+                    "Success Rate (%)": f"{success_rate:.1f}%",
+                    "Total Throughput (txn/s)": f"{total_throughput:.2f}",
+                    "Avg Transactions/Run": int((total_success + total_failed) / len(test_logs)) if len(test_logs) > 0 else 0
+                })
+            
+            test_case_df = pd.DataFrame(test_case_perf)
+            st.dataframe(test_case_df, use_container_width=True, height=200)
+            
+            st.divider()
+            
+            # ===== RECOMMENDATION =====
+            st.subheader("Recommendation & Analysis")
+            
+            # Find best isolation level
+            best_isolation = comparison_df.loc[comparison_df["Throughput (txn/s)"].str.replace("txn/s", "").astype(float).idxmax()]
+            best_consistency = comparison_df.loc[comparison_df["Anomalies Detected"].idxmin()]
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.info(f"""
+                **Highest Throughput:**
+                - Isolation Level: {best_isolation['Isolation Level']}
+                - Throughput: {best_isolation['Throughput (txn/s)']}
+                - Success Rate: {best_isolation['Success Rate (%)']}
+                """)
+            
+            with col2:
+                st.info(f"""
+                **Best Consistency:**
+                - Isolation Level: {best_consistency['Isolation Level']}
+                - Anomalies: {best_consistency['Anomalies Detected']}
+                - Success Rate: {best_consistency['Success Rate (%)']}
+                """)
+            
+            # Generate written recommendation
+            st.markdown("""
+            ### Key Findings:
+            
+            1. **Throughput vs Consistency Trade-off:**
+               - Lower isolation levels (READ UNCOMMITTED, READ COMMITTED) allow higher throughput
+               - Higher isolation levels (REPEATABLE READ, SERIALIZABLE) prevent anomalies but reduce throughput
+            
+            2. **Anomaly Prevention:**
+               - READ UNCOMMITTED: May allow dirty reads, non-repeatable reads, lost updates
+               - READ COMMITTED: Prevents dirty reads, but allows non-repeatable reads and lost updates
+               - REPEATABLE READ: Prevents dirty reads and non-repeatable reads, may allow lost updates (depends on implementation)
+               - SERIALIZABLE: Prevents all anomalies by serializing transactions
+            
+            3. **Recommendation for Production:**
+            """)
+            
+            # Provide intelligent recommendation
+            if best_consistency['Anomalies Detected'] == 0:
+                st.success(f"""
+                Use **{best_consistency['Isolation Level']}** for production:
+                - Prevents all detected anomalies
+                - Provides strong consistency guarantees
+                - Still maintains reasonable throughput: {best_consistency['Throughput (txn/s)']}
+                """)
+            else:
+                st.warning(f"""
+                Use **{best_isolation['Isolation Level']}** for high-volume scenarios:
+                - Highest throughput: {best_isolation['Throughput (txn/s)']}
+                - Success rate: {best_isolation['Success Rate (%)']}
+                - Note: Some anomalies may occur. Monitor closely.
+                
+                **Alternative:** Use **{best_consistency['Isolation Level']}** for critical data.
+                """)
+            
+            st.divider()
+            
+            # Export results
+            st.subheader("Export Results")
+            
+            csv_data = results_df.to_csv(index=False)
+            st.download_button(
+                label="Download Detailed Results (CSV)",
+                data=csv_data,
+                file_name="concurrency_test_results.csv",
+                mime="text/csv"
+            )
+            
+            # Summary report
+            summary_text = f"""
+CONCURRENCY CONTROL HIGH VOLUME ANALYSIS REPORT
+Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+TEST CONFIGURATION:
+- Isolation Levels Tested: {', '.join(selected_isolation_levels)}
+- Test Cases Executed: {', '.join(selected_test_cases)}
+- Iterations Per Test: {num_iterations}
+
+BEST PERFORMERS:
+- Highest Throughput: {best_isolation['Isolation Level']} ({best_isolation['Throughput (txn/s)']})
+- Best Consistency: {best_consistency['Isolation Level']} ({best_consistency['Anomalies Detected']} anomalies)
+
+SUMMARY TABLE:
+{comparison_df.to_string()}
+
+ANOMALY SUMMARY:
+{anomaly_df.to_string()}
+
+TEST CASE PERFORMANCE:
+{test_case_df.to_string()}
+
+RECOMMENDATION:
+Use {best_isolation['Isolation Level']} for maximum throughput or {best_consistency['Isolation Level']} for maximum consistency.
+            """
+            
+            st.download_button(
+                label="Download Analysis Report (TXT)",
+                data=summary_text,
+                file_name="concurrency_analysis_report.txt",
+                mime="text/plain"
+            )
 
 
 # TAB 4: TRANSACTION LOGS ==============================
@@ -2487,7 +2866,7 @@ with tab5:
 
             upd_newdate = st.date_input(
                 "New Transaction Date",
-                value=min_date,  # FIX: Add value parameter
+                value=min_date,
                 min_value=min_date,
                 max_value=max_date
             )
