@@ -96,6 +96,18 @@ if 'node_status' not in st.session_state:
 if 'simulated_failures' not in st.session_state:
     st.session_state.simulated_failures = {}
 
+# Manual Transaction Control State
+if 'active_connection' not in st.session_state:
+    st.session_state.active_connection = None
+if 'active_node' not in st.session_state:
+    st.session_state.active_node = None
+if 'transaction_active' not in st.session_state:
+    st.session_state.transaction_active = False
+if 'transaction_operations' not in st.session_state:
+    st.session_state.transaction_operations = []
+if 'transaction_start_time' not in st.session_state:
+    st.session_state.transaction_start_time = None
+
 
 # DATABASE CONNECTION ==============================
 class DatabaseConnection:
@@ -103,6 +115,7 @@ class DatabaseConnection:
         self.config = config
         self.connection = None
         self.cursor = None
+        self.in_transaction = False  # Track if we're in a managed transaction
         
     def connect(self):
         try:
@@ -115,6 +128,49 @@ class DatabaseConnection:
         except Error as e:
             st.error(f"Connection failed: {e}")
             return False
+    
+    def is_connection_alive(self):
+        """Check if connection is still valid"""
+        try:
+            if self.connection and self.connection.is_connected():
+                self.connection.ping(reconnect=False)
+                return True
+        except:
+            return False
+        return False
+    
+    def ensure_connected(self):
+        """Reconnect if connection was lost"""
+        if not self.is_connection_alive():
+            self.connect()
+    
+    def begin_transaction(self):
+        """Start an explicit transaction without auto-committing"""
+        if not self.connection or not self.connection.is_connected():
+            if not self.connect():
+                raise Exception("Failed to connect to database")
+        
+        cursor = self.connection.cursor()
+        cursor.execute("START TRANSACTION")
+        cursor.close()
+        
+        # Disable auto-commit for this connection
+        self.connection.autocommit = False
+        self.in_transaction = True
+    
+    def commit_transaction(self):
+        """Commit the current transaction and re-enable auto-commit"""
+        if self.in_transaction and self.connection:
+            self.connection.commit()
+            self.in_transaction = False
+            self.connection.autocommit = True
+    
+    def rollback_transaction(self):
+        """Rollback the current transaction and re-enable auto-commit"""
+        if self.in_transaction and self.connection:
+            self.connection.rollback()
+            self.in_transaction = False
+            self.connection.autocommit = True
     
     def execute_query(self, query, params=None, fetch=True, isolation_level=None):
         # TODO thara: concurrency control
@@ -169,14 +225,17 @@ class DatabaseConnection:
                 result = self.cursor.fetchall()
                 return result
             else:
-                # write operation
-                self.connection.commit()
+                # write operation - only auto-commit if NOT in a managed transaction
+                if not self.in_transaction:
+                    self.connection.commit()
                 return {"affected_rows": self.cursor.rowcount}
 
         except Error as e:
             if self.connection:
                 try:
-                    self.connection.rollback()
+                    # Only rollback if not in managed transaction (let user control it)
+                    if not self.in_transaction:
+                        self.connection.rollback()
                 except Exception:
                     pass
             return {"error": str(e)}
@@ -1896,12 +1955,13 @@ with st.sidebar:
         st.rerun()
 
 # MAIN TABS ==============================
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Database View", 
     "Concurrency Testing", 
     "Failure Recovery", 
     "Log Tracking",
-    "Database Operations"
+    "Database Operations",
+    "Manual Transaction Control"
 ])
 
 # TAB 1: DATABASE VIEW ==============================
@@ -2817,6 +2877,264 @@ with tab5:
                         st.info(f"No transactions found above ${threshold:,.2f}")
                     
                     db.close()
+
+# TAB 6: MANUAL TRANSACTION CONTROL ==============================
+with tab6:
+    st.header("Manual Transaction Control")
+    st.info("""Control transaction lifecycle step-by-step for concurrency testing.
+    
+    **Testing with 2 instances:**
+    - Local: `streamlit run app.py --server.port 8501` and `--server.port 8502`
+    - Deployed: Open app in different browsers (Chrome, Firefox, etc.) or incognito mode
+    - Coordinate timing between instances to create concurrent scenarios
+    """)
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Transaction Controls")
+        
+        # Node selection
+        selected_node = st.selectbox(
+            "Select Node", 
+            list(NODE_CONFIGS.keys()),
+            key="manual_txn_node",
+            disabled=st.session_state.transaction_active
+        )
+        
+        # Isolation level
+        isolation = st.selectbox(
+            "Isolation Level",
+            ["READ UNCOMMITTED", "READ COMMITTED", "REPEATABLE READ", "SERIALIZABLE"],
+            index=2,
+            key="manual_isolation",
+            disabled=st.session_state.transaction_active
+        )
+        
+        st.divider()
+        
+        # Transaction lifecycle buttons
+        if not st.session_state.transaction_active:
+            if st.button("START TRANSACTION", type="primary", use_container_width=True):
+                try:
+                    # Create connection
+                    db = DatabaseConnection(NODE_CONFIGS[selected_node])
+                    if not db.connect():
+                        st.error(f"Failed to connect to {selected_node}")
+                        st.stop()
+                    
+                    # Set isolation level
+                    set_isolation_level(db.connection, isolation, per_transaction=False)
+                    
+                    # Begin transaction
+                    db.begin_transaction()
+                    
+                    # Store in session state
+                    st.session_state.active_connection = db
+                    st.session_state.active_node = selected_node
+                    st.session_state.transaction_active = True
+                    st.session_state.transaction_operations = []
+                    st.session_state.transaction_start_time = time.time()
+                    
+                    st.success(f"Transaction started on {selected_node}")
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"Failed to start transaction: {e}")
+        else:
+            # Check connection health
+            if not st.session_state.active_connection.is_connection_alive():
+                st.error("Connection lost! Transaction was automatically rolled back.")
+                st.session_state.transaction_active = False
+                st.session_state.active_connection = None
+                st.rerun()
+            
+            # Show transaction info
+            duration = time.time() - st.session_state.transaction_start_time
+            st.success(f"Transaction ACTIVE on **{st.session_state.active_node}**")
+            st.metric("Duration", f"{duration:.1f}s")
+            st.metric("Isolation Level", isolation)
+            
+            if duration > 60:
+                st.warning(f"Transaction open for {duration:.0f}s - commit or rollback soon!")
+            
+            st.divider()
+            
+            col_commit, col_rollback = st.columns(2)
+            
+            with col_commit:
+                if st.button("COMMIT", type="primary", use_container_width=True):
+                    try:
+                        st.session_state.active_connection.commit_transaction()
+                        st.session_state.active_connection.close()
+                        
+                        st.success("Transaction committed!")
+                        st.session_state.transaction_active = False
+                        st.session_state.active_connection = None
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Commit failed: {e}")
+            
+            with col_rollback:
+                if st.button("ROLLBACK", type="secondary", use_container_width=True):
+                    try:
+                        st.session_state.active_connection.rollback_transaction()
+                        st.session_state.active_connection.close()
+                        
+                        st.warning("Transaction rolled back")
+                        st.session_state.transaction_active = False
+                        st.session_state.active_connection = None
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Rollback failed: {e}")
+    
+    with col2:
+        st.subheader("Execute Operations")
+        
+        if not st.session_state.transaction_active:
+            st.info("Start a transaction first")
+        else:
+            operation_type = st.radio(
+                "Operation Type",
+                ["SELECT (Read)", "UPDATE (Write)", "Custom SQL"],
+                key="manual_op_type"
+            )
+            
+            if operation_type == "SELECT (Read)":
+                trans_id = st.number_input("Transaction ID", min_value=1, key="manual_read_id")
+                lock_for_update = st.checkbox("Lock row (FOR UPDATE)", value=False, key="lock_read")
+                
+                if st.button("Execute SELECT", use_container_width=True):
+                    try:
+                        if lock_for_update:
+                            query = "SELECT * FROM trans WHERE trans_id = %s FOR UPDATE"
+                        else:
+                            query = "SELECT * FROM trans WHERE trans_id = %s"
+                        
+                        result = st.session_state.active_connection.execute_query(
+                            query, 
+                            params=(trans_id,),
+                            fetch=True
+                        )
+                        
+                        st.session_state.transaction_operations.append({
+                            "time": datetime.now().strftime("%H:%M:%S"),
+                            "operation": "SELECT" + (" FOR UPDATE" if lock_for_update else ""),
+                            "query": query,
+                            "params": trans_id,
+                            "result": result
+                        })
+                        
+                        if result:
+                            st.success(f"Read {len(result)} row(s)" + (" with lock" if lock_for_update else ""))
+                            st.dataframe(pd.DataFrame(result), use_container_width=True)
+                        else:
+                            st.warning("No rows found")
+                            
+                    except Exception as e:
+                        st.error(f"SELECT failed: {e}")
+                        if "Lock wait timeout" in str(e):
+                            st.warning("Another transaction is holding a lock on this row!")
+            
+            elif operation_type == "UPDATE (Write)":
+                trans_id = st.number_input("Transaction ID", min_value=1, key="manual_update_id")
+                new_balance = st.number_input("New Balance", min_value=0.0, step=0.01, key="manual_balance")
+                
+                lock_row = st.checkbox("Lock row first (SELECT FOR UPDATE)", value=True)
+                
+                if st.button("Execute UPDATE", use_container_width=True):
+                    try:
+                        operations = []
+                        
+                        if lock_row:
+                            # Lock the row first
+                            lock_query = "SELECT * FROM trans WHERE trans_id = %s FOR UPDATE"
+                            result = st.session_state.active_connection.execute_query(
+                                lock_query,
+                                params=(trans_id,),
+                                fetch=True
+                            )
+                            operations.append(f"Locked row {trans_id}")
+                            if result:
+                                st.info(f"Row locked: balance = {result[0].get('balance')}")
+                            else:
+                                st.warning("Row not found!")
+                                st.stop()
+                        
+                        # Update
+                        update_query = "UPDATE trans SET balance = %s WHERE trans_id = %s"
+                        result = st.session_state.active_connection.execute_query(
+                            update_query,
+                            params=(new_balance, trans_id),
+                            fetch=False
+                        )
+                        operations.append(f"Updated trans_id={trans_id} to balance={new_balance}")
+                        
+                        st.session_state.transaction_operations.append({
+                            "time": datetime.now().strftime("%H:%M:%S"),
+                            "operation": "UPDATE",
+                            "operations": operations,
+                            "result": result
+                        })
+                        
+                        st.success(f"UPDATE executed (not committed yet)")
+                        st.json(result)
+                        st.info("Click COMMIT to make changes permanent")
+                        
+                    except Exception as e:
+                        st.error(f"UPDATE failed: {e}")
+                        if "Lock wait timeout" in str(e) or "1205" in str(e):
+                            st.warning("Lock wait timeout! Another transaction is holding the lock.")
+                        elif "Deadlock" in str(e) or "1213" in str(e):
+                            st.error("Deadlock detected! This transaction was chosen as victim.")
+            
+            else:  # Custom SQL
+                custom_sql = st.text_area(
+                    "SQL Query", 
+                    height=100, 
+                    key="manual_custom_sql",
+                    placeholder="SELECT * FROM trans WHERE account_id = 1 FOR UPDATE"
+                )
+                
+                if st.button("Execute Custom SQL", use_container_width=True):
+                    if not custom_sql.strip():
+                        st.warning("Please enter a SQL query")
+                    else:
+                        try:
+                            is_select = custom_sql.strip().upper().startswith("SELECT")
+                            result = st.session_state.active_connection.execute_query(
+                                custom_sql,
+                                fetch=is_select
+                            )
+                            
+                            st.session_state.transaction_operations.append({
+                                "time": datetime.now().strftime("%H:%M:%S"),
+                                "operation": "CUSTOM",
+                                "query": custom_sql,
+                                "result": result
+                            })
+                            
+                            st.success("Query executed")
+                            if is_select and result:
+                                st.dataframe(pd.DataFrame(result), use_container_width=True)
+                            else:
+                                st.json(result)
+                                
+                        except Exception as e:
+                            st.error(f"Query failed: {e}")
+    
+    # Operation Log
+    st.divider()
+    st.subheader("Transaction Operation Log")
+    
+    if st.session_state.transaction_operations:
+        for i, op in enumerate(st.session_state.transaction_operations):
+            with st.expander(f"{i+1}. {op['time']} - {op['operation']}", expanded=(i == len(st.session_state.transaction_operations)-1)):
+                st.json(op)
+    else:
+        st.info("No operations yet in this transaction")
 
 st.divider()
 st.caption("MCO2 - Group 8 | STADVDB - S17")
