@@ -15,54 +15,54 @@ load_dotenv()
 CURRENT_NODE_NAME = os.getenv("APP_NODE_ID") if os.getenv("APP_NODE_ID") else "Central Node"
 
 # NODE CONFIGURATION ==============================
-NODE_CONFIGS = {
-    "Central Node": {
-        "host": "10.2.14.3",
-        "port": 3306,
-        "user": "user1",
-        "password": "UserPass123!",
-        "database": "mco2financedata"
-    },
-    "Node 2": {
-        "host": "10.2.14.4",
-        "port": 3306,
-        "user": "user1",
-        "password": "UserPass123!",
-        "database": "mco2financedata"
-    },
-    "Node 3": {
-        "host": "10.2.14.5",
-        "port": 3306,
-        "user": "user1",
-        "password": "UserPass123!",
-        "database": "mco2financedata"
-    }
-}
-
-# TO RUN LOCAL, use the following NODE_CONFIGS instead
 # NODE_CONFIGS = {
-#   "Central Node": {
-#         "host": "ccscloud.dlsu.edu.ph", # type: ignore # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
-#         "port": 60703, # TO RUN LOCAL, change to 60703
+#     "Central Node": {
+#         "host": "10.2.14.3",
+#         "port": 3306,
 #         "user": "user1",
 #         "password": "UserPass123!",
 #         "database": "mco2financedata"
 #     },
 #     "Node 2": {
-#         "host": "ccscloud.dlsu.edu.ph",  # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
-#         "port": 60704, # TO RUN LOCAL, change to 60704
+#         "host": "10.2.14.4",
+#         "port": 3306,
 #         "user": "user1",
 #         "password": "UserPass123!",
 #         "database": "mco2financedata"
 #     },
 #     "Node 3": {
-#         "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
-#         "port": 60705, # TO RUN LOCAL, change to 60705
+#         "host": "10.2.14.5",
+#         "port": 3306,
 #         "user": "user1",
 #         "password": "UserPass123!",
 #         "database": "mco2financedata"
 #     }
 # }
+
+# TO RUN LOCAL, use the following NODE_CONFIGS instead
+NODE_CONFIGS = {
+  "Central Node": {
+        "host": "ccscloud.dlsu.edu.ph", # type: ignore # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
+        "port": 60703, # TO RUN LOCAL, change to 60703
+        "user": "user1",
+        "password": "UserPass123!",
+        "database": "mco2financedata"
+    },
+    "Node 2": {
+        "host": "ccscloud.dlsu.edu.ph",  # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
+        "port": 60704, # TO RUN LOCAL, change to 60704
+        "user": "user1",
+        "password": "UserPass123!",
+        "database": "mco2financedata"
+    },
+    "Node 3": {
+        "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
+        "port": 60705, # TO RUN LOCAL, change to 60705
+        "user": "user1",
+        "password": "UserPass123!",
+        "database": "mco2financedata"
+    }
+}
 
 
 # SESSION STATE INITIALIZATION ==============================
@@ -1088,6 +1088,16 @@ def replicate_to_central(source_node, query, params, trans_id=None, op_type=None
         if isinstance(res, dict) and res.get("error"):
             raise Exception(res.get("error"))
         success = True
+        # Log on target (Central) for the applied write
+        log_transaction_event(
+            node_name="Central Node",
+            trans_id=trans_id,
+            op_type=op_type or "UNKNOWN",
+            pk_value=pk_value or (str(trans_id) if trans_id is not None else None),
+            old_amount=old_amount,
+            new_amount=new_amount,
+            status="COMMITTED"
+        )
     except Exception as e:
         error_msg = str(e)
     finally:
@@ -1135,6 +1145,16 @@ def replicate_from_central(target_node, query, params, trans_id=None, op_type=No
         if isinstance(res, dict) and res.get("error"):
             raise Exception(res.get("error"))
         success = True
+        # Log on target node for the applied write
+        log_transaction_event(
+            node_name=target_node,
+            trans_id=trans_id,
+            op_type=op_type or "UNKNOWN",
+            pk_value=pk_value or (str(trans_id) if trans_id is not None else None),
+            old_amount=old_amount,
+            new_amount=new_amount,
+            status="COMMITTED"
+        )
     except Exception as e:
         error_msg = str(e)
     finally:
@@ -1524,8 +1544,21 @@ with tab4:
     nodes = ["Central Node", "Node 2", "Node 3"]
     selected_node = st.selectbox("Select Node", ["All Nodes"] + nodes, key="selected_node")
     
-    start_time = st.date_input("Start Date",  min_value=datetime(1993, 1, 1).date(), max_value=datetime(1995, 12, 31).date(), value=None, key="start_time")
-    end_time = st.date_input("End Date",  min_value=datetime(1993, 1, 1).date(), max_value=datetime(1995, 12, 31).date(), value=None, key="end_time")
+    # Restrict to known data range (1993-1998)
+    start_time = st.date_input(
+        "Start Date",
+        value=datetime(1993, 1, 1).date(),
+        min_value=datetime(1993, 1, 1).date(),
+        max_value=datetime(1998, 12, 31).date(),
+        key="start_time",
+    )
+    end_time = st.date_input(
+        "End Date",
+        value=datetime(1998, 12, 31).date(),
+        min_value=datetime(1993, 1, 1).date(),
+        max_value=datetime(1998, 12, 31).date(),
+        key="end_time",
+    )
 
     status_options = ["All", "Success", "Failed"]
     selected_status = st.selectbox("Status", status_options, key="selected_status")
