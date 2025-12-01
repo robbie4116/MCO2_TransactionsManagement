@@ -54,8 +54,16 @@ NODE_CONFIGS = {
             "user": "user1",
             "password": "UserPass123!",
             "database": "mco2financedata"
+  "Central Node": {
+        "host": "ccscloud.dlsu.edu.ph", # type: ignore # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
+        "port": 60703, # TO RUN LOCAL, change to 60703
+        "user": "user1",
+        "password": "UserPass123!",
+        "database": "mco2financedata"
     },
     "Node 2": {
+        "host": "ccscloud.dlsu.edu.ph",  # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
+        "port": 60704, # TO RUN LOCAL, change to 60704
         "host": "ccscloud.dlsu.edu.ph",  # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
         "port": 60704, # TO RUN LOCAL, change to 60704
         "user": "user1",
@@ -65,11 +73,14 @@ NODE_CONFIGS = {
     "Node 3": {
         "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
         "port": 60705, # TO RUN LOCAL, change to 60705
+        "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
+        "port": 60705, # TO RUN LOCAL, change to 60705
         "user": "user1",
         "password": "UserPass123!",
         "database": "mco2financedata"
     }
 }
+
 
 # SESSION STATE INITIALIZATION ==============================
 if 'transaction_log' not in st.session_state:
@@ -1147,6 +1158,16 @@ def replicate_to_central(source_node, query, params, trans_id=None, op_type=None
         if isinstance(res, dict) and res.get("error"):
             raise Exception(res.get("error"))
         success = True
+        # Log on target (Central) for the applied write
+        log_transaction_event(
+            node_name="Central Node",
+            trans_id=trans_id,
+            op_type=op_type or "UNKNOWN",
+            pk_value=pk_value or (str(trans_id) if trans_id is not None else None),
+            old_amount=old_amount,
+            new_amount=new_amount,
+            status="COMMITTED"
+        )
     except Exception as e:
         error_msg = str(e)
     finally:
@@ -1194,6 +1215,16 @@ def replicate_from_central(target_node, query, params, trans_id=None, op_type=No
         if isinstance(res, dict) and res.get("error"):
             raise Exception(res.get("error"))
         success = True
+        # Log on target node for the applied write
+        log_transaction_event(
+            node_name=target_node,
+            trans_id=trans_id,
+            op_type=op_type or "UNKNOWN",
+            pk_value=pk_value or (str(trans_id) if trans_id is not None else None),
+            old_amount=old_amount,
+            new_amount=new_amount,
+            status="COMMITTED"
+        )
     except Exception as e:
         error_msg = str(e)
     finally:
@@ -1235,7 +1266,20 @@ def simulate_node_failure(node_name):
     """
     st.session_state.node_status[node_name] = False
     st.session_state.simulated_failures[node_name] = datetime.now()
-    pass
+    try: 
+        # Always log to Central Node database
+        db = DatabaseConnection(NODE_CONFIGS["Central Node"])
+        if db.connect():
+            cur=db.connection.cursor()
+            cur.execute(
+                "INSERT INTO recovery_log (node, downtime_start, status) VALUES (%s, NOW(), 'FAILED')",
+                (to_log_node_name(node_name),)
+            )
+            db.connection.commit()
+            cur.close()
+            db.close()
+    except Exception as e:
+        st.warning(f"Failed to log failure for {node_name}: {e}")
 
 def simulate_node_recovery(node_name):
     """
@@ -1255,16 +1299,177 @@ def simulate_node_recovery(node_name):
     # 1. Get all missed transactions while node was down
     # 2. Replay them in order
     # 3. Handle any conflicts
-    
+    if node_name not in st.session_state.simulated_failures:
+        st.warning(f"{node_name} was never marked as failed; cannot simulate recovery")
+        return 
+    downtime_start = st.session_state.simulated_failures[node_name]
+    downtime_end = datetime.now()
+
+    if node_name == "Central Node":
+        source_nodes = ["Node 2", "Node 3"]
+        replayed_count = 0
+
+        for src in source_nodes:
+            db_src = DatabaseConnection(NODE_CONFIGS[src])
+            if not db_src.connect():
+                continue
+            #Query replication_log on source node for FAILED replications to Central during downtime
+            curr = db_src.connection.cursor(dictionary=True)
+            curr.execute(
+                """
+                SELECT log_id, trans_id, op_type, old_amount, new_amount
+                FROM replication_log
+                WHERE target_node = %s
+                AND status = 'FAILED'
+                AND created_at BETWEEN %s AND %s
+                ORDER BY created_at ASC
+                """,
+                (to_log_node_name("Central Node"), downtime_start, downtime_end)
+            )
+            failed_reps = curr.fetchall()
+            curr.close()
+            
+            # Replay Each missed transaction on Central Node
+            for rep in failed_reps:
+                trans_id = rep['trans_id']
+
+                row = fetch_trans_row(src, trans_id)
+                if not row:
+                    continue
+                if rep['op_type'] == 'INSERT':
+                    query = """
+                    INSERT INTO trans (trans_id, account_id, newdate, type, operation, amount, balance, account)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                    account_id=VALUES(account_id),
+                    newdate=VALUES(newdate),
+                    type=VALUES(type),
+                    operation=VALUES(operation),
+                    amount=VALUES(amount),
+                    balance=VALUES(balance),
+                    account=VALUES(account)
+                    """
+                    params = (row['trans_id'], row['account_id'], row['newdate'], row['type'], row['operation'], row['amount'], row['balance'], row['account'])
+                elif rep['op_type'] == 'UPDATE':
+                    query = """
+                        UPDATE trans SET account_id=%s, newdate=%s, type=%s, operation=%s, amount=%s, balance=%s, account=%s
+                        WHERE trans_id=%s
+                    """
+                    params = (row['account_id'], row['newdate'], row['type'], row['operation'], row['amount'], row['balance'], row['account'], trans_id)
+                elif rep['op_type'] == 'DELETE':
+                    query = "DELETE FROM trans WHERE trans_id=%s"
+                    params = (trans_id,)
+                else:
+                    continue
+
+                db_central = DatabaseConnection(NODE_CONFIGS["Central Node"])
+                if db_central.connect():
+                    result = db_central.execute_query(query, params=params, fetch=False)
+                    if not (isinstance(result, dict) and result.get("error")):
+                        replayed_count += 1
+                        #Mark as REPLAYED in replication_log
+                        update_replication_log_status(
+                            src, rep['log_id'], "REPLAYED")
+                    db_central.close()
+            db_src.close()
+    else:
+        db_central = DatabaseConnection(NODE_CONFIGS["Central Node"])
+        if not db_central.connect():
+            st.warning("Cannot connect to Central Node for recovery")
+            return
+        # Query replication_log on Central Node for FAILED replications to this node during downtime
+        curr = db_central.connection.cursor(dictionary=True)
+        curr.execute(
+            """
+            SELECT log_id, trans_id, op_type, old_amount, new_amount
+            FROM replication_log
+            WHERE target_node = %s
+            AND status = 'FAILED'
+            AND created_at BETWEEN %s AND %s
+            ORDER BY created_at ASC
+            """,
+            (to_log_node_name(node_name), downtime_start, downtime_end)
+        )
+        failed_reps = curr.fetchall()
+        curr.close()
+        replayed_count = 0
+
+        #Replay each missed transaction on recovered node
+        for rep in failed_reps:
+            trans_id = rep['trans_id']
+
+            row = fetch_trans_row("Central Node", trans_id)
+            if not row:
+                continue
+
+            #Reconstruct query based on op_type
+            if rep['op_type'] == 'INSERT':
+                query = """
+                    INSERT INTO trans(trans_id, account_id, newdate, type, operation, amount, balance, account)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                    account_id=VALUES(account_id),
+                    newdate=VALUES(newdate),
+                    type=VALUES(type),
+                    operation=VALUES(operation),
+                    amount=VALUES(amount),
+                    balance=VALUES(balance),
+                    account=VALUES(account)
+                """
+                params = (row['trans_id'], row['account_id'], row['newdate'], row['type'], row['operation'], row['amount'], row['balance'], row['account'])
+            elif rep['op_type'] == 'UPDATE':
+                query = """
+                    UPDATE trans SET account_id=%s, newdate=%s, type=%s, operation=%s, amount=%s, balance=%s, account=%s
+                    WHERE trans_id=%s
+                """
+                params = (row['account_id'], row['newdate'], row['type'], row['operation'], row['amount'], row['balance'], row['account'], trans_id)
+            elif rep['op_type'] == 'DELETE':
+                query = "DELETE FROM trans WHERE trans_id=%s"
+                params = (trans_id,)
+            else:
+                continue
+            db_node = DatabaseConnection(NODE_CONFIGS[node_name])
+            if db_node.connect():
+                result = db_node.execute_query(query, params=params, fetch=False)
+                if not (isinstance(result, dict) and result.get("error")):
+                    replayed_count += 1
+                    # Mark as REPLAYED in replication_log
+                    update_replication_log_status(
+                        "Central Node", rep['log_id'], "REPLAYED")
+                db_node.close()
+        db_central.close()
+
+    db = DatabaseConnection(NODE_CONFIGS[node_name])
+    if db.connect():
+        curr = db.connection.cursor()
+        curr.execute(
+            """
+            UPDATE recovery_log
+            SET downtime_end = NOW(), 
+                replayed_count = %s,
+                status = 'SUCCESS'
+            WHERE node = %s
+                AND status = 'FAILED'
+            ORDER BY downtime_start DESC
+            LIMIT 1
+            """,
+            (replayed_count, to_log_node_name(node_name),)
+        )
+        db.connection.commit()
+        curr.close()
+        db.close()
+
+    # Also add to session state for immediate display
     recovery_log = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
         "node": node_name,
-        "downtime": None,  # TODO (jeff): Calculate downtime
-        "missed_transactions": 0,  # TODO (jeff): Count missed transactions
-        "status": "recovered"
+        "downtime": str(downtime_end - downtime_start),
+        "missed_transactions": replayed_count,
+        "status": "SUCCESS"
     }
     st.session_state.recovery_log.append(recovery_log)
-    pass
+    del st.session_state.simulated_failures[node_name]
+    
 
 def test_replication_failure_to_central():
     """
@@ -1278,13 +1483,72 @@ def test_replication_failure_to_central():
     4. Log failure
     5. Verify Node 2/3 still has the data
     """
-    pass
+    simulate_node_failure("Central Node")
+    st.info("Central Node marked as offline")
+
+    trans_id= 999991
+
+    db_node = DatabaseConnection(NODE_CONFIGS["Node 2"])
+    if not db_node.connect():
+        st.error("Cannot connect to Node 2 for test")
+        return
+    result = db_node.execute_query(
+        """
+        INSERT INTO trans (trans_id, account_id, newdate, type, operation, amount, balance, account)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        params=(trans_id, 1, '1994-06-15', 'TestCredit', 'Test Case #1: Replication Failure', 500.00, 500.00, 'Test 001'),
+        fetch=False
+    )
+    db_node.close()
+
+    if isinstance(result, dict) and result.get("error"):
+        st.error(f"Failed to perform write on Node 2: {result.get('error')}")
+        return
+    
+    st.info(f"Transaction {trans_id} written to Node 2")
+
+    #log transaction
+    log_transaction_event(
+        node_name="Node 2",
+        trans_id=trans_id,
+        op_type="INSERT",
+        pk_value=str(trans_id),
+        old_amount=None,
+        new_amount=500.00,
+        status="COMMITTED"
+    )
+
+    #Attempt replication (should fail)
+    row = fetch_trans_row("Node 2", trans_id)
+    if row:
+        route_and_replicate_write("Node 2", trans_id, "INSERT", None, row)
+        st.info(f"Replication attempted - should be logged as FAILED")
+    
+    # Verify Node 2 still has the data
+    db_verify = DatabaseConnection(NODE_CONFIGS["Node 2"])
+    if db_verify.connect():
+        verify_result = db_verify.execute_query(
+            "SELECT * FROM trans WHERE trans_id = %s",
+            params=(trans_id,),
+            fetch=True
+        )
+        db_verify.close()
+        
+        if verify_result and len(verify_result) > 0:
+            st.success(f"Node 2 transaction {trans_id}")
+            st.json(verify_result[0]) 
+        else:
+            st.error(f"Verification failed - transaction not found on Node 2")
+    st.divider()
+    st.markdown('### Test Case #1 Complete')
+    st.info("Check 'Transaction Logs' tab ('Replication Logs') to see FAILED status")
+    st.info("Central Node is offline, so replication failed but Node 2 kept the data")
 
 def test_central_recovery_missed_writes():
     """
     Case #2: Central Node recovers and needs to catch up on missed writes
     
-    TODO (jeff): Implement this test case
     Steps:
     1. Simulate Central Node failure
     2. Execute writes on Node 2/3 while Central is down
@@ -1292,13 +1556,82 @@ def test_central_recovery_missed_writes():
     4. Replay missed transactions
     5. Verify all nodes are consistent
     """
-    pass
+    # 1. Fail Central
+    simulate_node_failure("Central Node")
+    st.info(" Central Node marked as offline")
+
+    # 2. Write to Node 2 while Central is down
+    trans_id = 999992
+    
+    db = DatabaseConnection(NODE_CONFIGS["Node 2"])
+    if not db.connect():
+        st.error("Cannot connect to Node 2")
+        return
+    
+    result = db.execute_query(
+        """
+        INSERT INTO trans (trans_id, account_id, newdate, type, operation, amount, balance, account)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        params=(trans_id, 2, '1994-08-20', 'TestDebit', 'Test Case #2: Central Recovery', 750.00, 7500.00, 'TEST002'),
+        fetch=False
+    )
+    db.close()
+    
+    if isinstance(result, dict) and result.get("error"):
+        st.error(f"Write failed on Node 2: {result.get('error')}")
+        return
+    
+    st.info(f"Transaction {trans_id} written to Node 2 while Central is offline")
+    
+    # 3. Log and attempt replication (will fail)
+    log_transaction_event(
+        node_name="Node 2",
+        trans_id=trans_id,
+        op_type="INSERT",
+        pk_value=str(trans_id),
+        old_amount=None,
+        new_amount=750.00,
+        status="COMMITTED"
+    )
+    
+    row = fetch_trans_row("Node 2", trans_id)
+    if row:
+        route_and_replicate_write("Node 2", trans_id, "INSERT", None, row)
+        st.info("Replication failed - logged as FAILED in replication_log")
+    
+    # 4. Recover Central (this triggers REDO)
+    st.info("Recovering Central Node...")
+    simulate_node_recovery("Central Node")
+    st.success("Central Node recovery completed")
+    
+    # 5. Verify Central now has the transaction
+    db_central = DatabaseConnection(NODE_CONFIGS["Central Node"])
+    if db_central.connect():
+        verify_result = db_central.execute_query(
+            "SELECT * FROM trans WHERE trans_id = %s",
+            params=(trans_id,),
+            fetch=True
+        )
+        db_central.close()
+        
+        if verify_result and len(verify_result) > 0:
+            st.success(f"REDO successful! Central now has transaction {trans_id}")
+            st.json(verify_result[0])
+        else:
+            st.error("failed - transaction not found on Central after recovery")
+    
+    # Summary
+    st.divider()
+    st.markdown("### Case #2 Test Complete")
+    st.info("Check 'Failure Recovery' tab → 'Recovery Log' to see recovery details")
+    st.info("Central replayed missed transactions from Node 2 using REDO recovery")
+
 
 def test_replication_failure_from_central():
     """
     Case #3: Transaction fails when replicating from Central to Node 2/3
     
-    TODO (jeff): Implement this test case
     Steps:
     1. Simulate Node 2 or 3 failure
     2. Execute write on Central
@@ -1306,13 +1639,78 @@ def test_replication_failure_from_central():
     4. Log failure
     5. Verify Central still has the data
     """
-    pass
+    # 1. Fail Node 2
+    simulate_node_failure("Node 2")
+    st.info("Node 2 marked as offline")
+    
+    # 2. Execute a write on Central (that should replicate to Node 2)
+    trans_id = 999993
+    
+    db = DatabaseConnection(NODE_CONFIGS["Central Node"])
+    if not db.connect():
+        st.error("Cannot connect to Central Node")
+        return
+    
+    result = db.execute_query(
+        """
+        INSERT INTO trans (trans_id, account_id, newdate, type, operation, amount, balance, account)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        params=(trans_id, 3, '1995-03-10', 'TestCredit', 'Test Case #3: Replication Failure', 1000.00, 10000.00, 'TEST003'),
+        fetch=False
+    )
+    db.close()
+    
+    if isinstance(result, dict) and result.get("error"):
+        st.error(f"Write failed on Central: {result.get('error')}")
+        return
+    
+    st.info(f"Transaction {trans_id} written to Central Node")
+    
+    # 3. Log the transaction
+    log_transaction_event(
+        node_name="Central Node",
+        trans_id=trans_id,
+        op_type="INSERT",
+        pk_value=str(trans_id),
+        old_amount=None,
+        new_amount=1000.00,
+        status="COMMITTED"
+    )
+    
+    # 4. Attempt replication to Node 2 (will fail because Node 2 is offline)
+    row = fetch_trans_row("Central Node", trans_id)
+    if row:
+        # Note: date 1995-03-10 is in Node 2's range (1993-1995)
+        route_and_replicate_write("Central Node", trans_id, "INSERT", None, row)
+        st.info("Replication to Node 2 attempted - should be logged as FAILED")
+    
+    # 5. Verify Central still has the data
+    db_verify = DatabaseConnection(NODE_CONFIGS["Central Node"])
+    if db_verify.connect():
+        verify_result = db_verify.execute_query(
+            "SELECT * FROM trans WHERE trans_id = %s",
+            params=(trans_id,),
+            fetch=True
+        )
+        db_verify.close()
+        
+        if verify_result and len(verify_result) > 0:
+            st.success(f"Verified - Central has transaction {trans_id}")
+            st.json(verify_result[0])
+        else:
+            st.error("Verification failed - transaction not found on Central")
+    
+    # Summary
+    st.divider()
+    st.markdown("### Case #3 Test Complete")
+    st.info("Check 'Transaction Logs' tab → 'Replication Logs' to see FAILED status")
+    st.info("Node 2 is offline, so replication failed but Central kept the data")
 
 def test_node_recovery_missed_writes():
     """
     Case #4: Node 2/3 recovers and needs to catch up on missed writes
     
-    TODO (jeff): Implement this test case
     Steps:
     1. Simulate Node 2 or 3 failure
     2. Execute writes on Central while node is down
@@ -1320,13 +1718,85 @@ def test_node_recovery_missed_writes():
     4. Replay missed transactions
     5. Verify all nodes are consistent
     """
-    pass
+    # 1. Fail Node 3
+    simulate_node_failure("Node 3")
+    st.info(" Node 3 marked as offline")
+    
+    # 2. Write to Central while Node 3 is down
+    trans_id = 999994
+    
+    db = DatabaseConnection(NODE_CONFIGS["Central Node"])
+    if not db.connect():
+        st.error("Cannot connect to Central Node")
+        return
+    
+    result = db.execute_query(
+        """
+        INSERT INTO trans (trans_id, account_id, newdate, type, operation, amount, balance, account)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        params=(trans_id, 4, '1997-11-25', 'TestDebit', 'Test Case #4: Node Recovery', 1250.00, 12500.00, 'TEST004'),
+        fetch=False
+    )
+    db.close()
+    
+    if isinstance(result, dict) and result.get("error"):
+        st.error(f"Write failed on Central: {result.get('error')}")
+        return
+    
+    st.info(f"Transaction {trans_id} written to Central while Node 3 is offline")
+    
+    # 3. Log and attempt replication (will fail)
+    log_transaction_event(
+        node_name="Central Node",
+        trans_id=trans_id,
+        op_type="INSERT",
+        pk_value=str(trans_id),
+        old_amount=None,
+        new_amount=1250.00,
+        status="COMMITTED"
+    )
+    
+    row = fetch_trans_row("Central Node", trans_id)
+    if row:
+        # Note: date 1997-11-25 is in Node 3's range (1996-1998)
+        route_and_replicate_write("Central Node", trans_id, "INSERT", None, row)
+        st.info("Replication to Node 3 failed - logged as FAILED")
+    
+    # 4. Recover Node 3 (this triggers REDO)
+    st.info("Recovering Node 3...")
+    simulate_node_recovery("Node 3")
+    st.success("Node 3 recovery completed")
+    
+    # 5. Verify Node 3 now has the transaction
+    db_node3 = DatabaseConnection(NODE_CONFIGS["Node 3"])
+    if db_node3.connect():
+        verify_result = db_node3.execute_query(
+            "SELECT * FROM trans WHERE trans_id = %s",
+            params=(trans_id,),
+            fetch=True
+        )
+        db_node3.close()
+        
+        if verify_result and len(verify_result) > 0:
+            st.success(f"REDO successful! Node 3 now has transaction {trans_id}")
+            st.json(verify_result[0])
+        else:
+            st.error("failed - transaction not found on Node 3 after recovery")
+    
+    # Summary
+    st.divider()
+    st.markdown("### Case #4 Test Complete")
+    st.info("Check 'Failure Recovery' tab → 'Recovery Log' to see recovery details")
+    st.info("Node 3 replayed missed transactions from Central using REDO recovery")
 
 # UTILITY FUNCTIONS 
 def check_node_health(node_name):
-    if node_name in st.session_state.simulated_failures:
+    # Check simulated status first
+    if not st.session_state.node_status.get(node_name, True):
         return False
     
+    # Then check actual database connection
     db = DatabaseConnection(NODE_CONFIGS[node_name])
     status = db.connect()
     db.close()
@@ -1362,11 +1832,13 @@ with st.sidebar:
         if st.button("Simulate Failure"):
             simulate_node_failure(node_to_simulate)
             st.warning(f"{node_to_simulate} failure simulated")
+            st.rerun()  # Refresh UI to show updated node status
             
     with col2:
         if st.button("Simulate Recovery"):
             simulate_node_recovery(node_to_simulate)
             st.success(f"{node_to_simulate} recovery initiated")
+            st.rerun()  # Refresh UI to show updated node status
 
     st.divider()
     st.header("Quick Actions")
@@ -1518,14 +1990,17 @@ with tab3:
     if st.button("Run Recovery Test"):
         st.info(f"Running {recovery_test_case}...")
         
-        # TODO (jeff): call function based on recovery_test_case
-        # if recovery_test_case == "Case #1...":
-        #     test_replication_failure_to_central()
-        # elif recovery_test_case == "Case #2...":
-        #     test_central_recovery_missed_writes()
-        # ... etc
+        if recovery_test_case == "Case #1: Node 2/3 → Central Replication Failure":
+            test_replication_failure_to_central()
+        elif recovery_test_case == "Case #2: Central Node Recovery (Missed Writes)":
+            test_central_recovery_missed_writes()
+        elif recovery_test_case == "Case #3: Central → Node 2/3 Replication Failure":
+            test_replication_failure_from_central()
+        elif recovery_test_case == "Case #4: Node 2/3 Recovery (Missed Writes)":
+            test_node_recovery_missed_writes()
         
         st.success("Recovery test completed! Check logs.")
+        st.rerun()  # Force UI refresh to show updated logs and node status
     
     st.divider()
     st.subheader("Recovery Log")
@@ -1660,6 +2135,21 @@ with tab4:
                                max_value=datetime(2025, 12, 31).date(), value=None, key="start_time")
     end_time = st.date_input("End Date", min_value=datetime(1993, 1, 1).date(), 
                              max_value=datetime(2025, 12, 31).date(), value=None, key="end_time")
+    # Restrict to known data range (1993-1998)
+    start_time = st.date_input(
+        "Start Date",
+        value=datetime(1993, 1, 1).date(),
+        min_value=datetime(1993, 1, 1).date(),
+        max_value=datetime(1998, 12, 31).date(),
+        key="start_time",
+    )
+    end_time = st.date_input(
+        "End Date",
+        value=datetime(1998, 12, 31).date(),
+        min_value=datetime(1993, 1, 1).date(),
+        max_value=datetime(1998, 12, 31).date(),
+        key="end_time",
+    )
 
     status_options = ["All", "PENDING", "COMMITTED", "ROLLED_BACK", "FAILED", "SUCCESS", "PARTIAL", "IN_PROGRESS"]
     selected_status = st.selectbox("Status", status_options, key="selected_status")
@@ -1714,7 +2204,14 @@ with tab4:
         display_log("Replication Logs", st.session_state.get("replication_log_db", []), "created_at")
     
     if log_type in ["Recovery Logs", "All Logs"]:
-        display_log("Recovery Logs", st.session_state.get("recovery_log_db", []), "created_at")
+        # Combine session state logs with database logs
+        session_recovery_logs = st.session_state.get("recovery_log_db", []), "created_at"
+        db_recovery_logs = fetch_recovery_logs_from_db()
+        
+        # Merge and deduplicate (prefer DB logs as source of truth)
+        all_recovery_logs = db_recovery_logs
+        
+        display_log("Recovery Logs", all_recovery_logs)
     
     
 # TAB 5: MANUAL OPERATIONS ==============================
