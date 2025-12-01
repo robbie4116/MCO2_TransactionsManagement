@@ -10,60 +10,66 @@ import os
 from contextlib import contextmanager
 from dotenv import load_dotenv
 
+# STREAMLIT UI 
+st.set_page_config(page_title="Distributed Database System", layout="wide")
+st.title("MCO2: Transaction Management & Recovery")
+st.markdown("### Corpuz, Cumti, Pineda, & Punsalan")
+
 # LOAD ENVIRONMENT VARIABLES ==============================
 load_dotenv()
 CURRENT_NODE_NAME = os.getenv("APP_NODE_ID") if os.getenv("APP_NODE_ID") else "Central Node"
 
-# NODE CONFIGURATION ==============================
-NODE_CONFIGS = {
-    "Central Node": {
-        "host": "10.2.14.3",
-        "port": 3306,
-        "user": "user1",
-        "password": "UserPass123!",
-        "database": "mco2financedata"
-    },
-    "Node 2": {
-        "host": "10.2.14.4",
-        "port": 3306,
-        "user": "user1",
-        "password": "UserPass123!",
-        "database": "mco2financedata"
-    },
-    "Node 3": {
-        "host": "10.2.14.5",
-        "port": 3306,
-        "user": "user1",
-        "password": "UserPass123!",
-        "database": "mco2financedata"
-    }
-}
 
-# TO RUN LOCAL, use the following NODE_CONFIGS instead
+# NODE CONFIGURATION ==============================
 # NODE_CONFIGS = {
-#   "Central Node": {
-#         "host": "ccscloud.dlsu.edu.ph", # type: ignore # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
-#         "port": 60703, # TO RUN LOCAL, change to 60703
+#     "Central Node": {
+#         "host": "10.2.14.3",
+#         "port": 3306,
 #         "user": "user1",
 #         "password": "UserPass123!",
 #         "database": "mco2financedata"
 #     },
 #     "Node 2": {
-#         "host": "ccscloud.dlsu.edu.ph",  # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
-#         "port": 60704, # TO RUN LOCAL, change to 60704
+#         "host": "10.2.14.4",
+#         "port": 3306,
 #         "user": "user1",
 #         "password": "UserPass123!",
 #         "database": "mco2financedata"
 #     },
 #     "Node 3": {
-#         "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
-#         "port": 60705, # TO RUN LOCAL, change to 60705
+#         "host": "10.2.14.5",
+#         "port": 3306,
 #         "user": "user1",
 #         "password": "UserPass123!",
 #         "database": "mco2financedata"
-#     }
-# }
+#    }
+#}
 
+
+# TO RUN LOCAL, use the following NODE_CONFIGS instead
+NODE_CONFIGS = {
+    "Central Node": {
+            "host": "ccscloud.dlsu.edu.ph", # type: ignore # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
+            "port": 60703, # TO RUN LOCAL, change to 60703
+            "user": "user1",
+            "password": "UserPass123!",
+            "database": "mco2financedata"
+    },
+    "Node 2": {
+        "host": "ccscloud.dlsu.edu.ph",  # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
+        "port": 60704, # TO RUN LOCAL, change to 60704
+        "user": "user1",
+        "password": "UserPass123!",
+        "database": "mco2financedata"
+    },
+    "Node 3": {
+        "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
+        "port": 60705, # TO RUN LOCAL, change to 60705
+        "user": "user1",
+        "password": "UserPass123!",
+        "database": "mco2financedata"
+    }
+}
 
 # SESSION STATE INITIALIZATION ==============================
 if 'transaction_log' not in st.session_state:
@@ -407,6 +413,59 @@ def log_transaction_event(node_name, trans_id, op_type, pk_value, old_amount=Non
         except Exception:
             pass
 
+# FETCH DATA FROM DATABASE
+    def fetch_logs_from_db():
+        try:
+            # Use Central Node to fetch logs (or whichever node stores your logs)
+            db = DatabaseConnection(NODE_CONFIGS["Central Node"])
+            if not db.connect():
+                st.error("Failed to connect to database for logs")
+                return [], [], []
+            
+            # Transaction logs
+            transaction_logs = db.execute_query("""
+                SELECT log_id, trans_id, node, table_name, op_type, 
+                    pk_value, old_amount, new_amount, status, 
+                    error_message, started_at, ended_at
+                FROM transaction_log
+                ORDER BY started_at DESC
+                LIMIT 1000
+            """, fetch=True)
+            
+            # Replication logs
+            replication_logs = db.execute_query("""
+                SELECT log_id, source_node, target_node, trans_id, 
+                    old_amount, new_amount, op_type, status, 
+                    error_message, created_at, completed_at
+                FROM replication_log
+                ORDER BY created_at DESC
+                LIMIT 1000
+            """, fetch=True)
+            
+            # Recovery logs
+            recovery_logs = db.execute_query("""
+                SELECT log_id, node, downtime_start, downtime_end, 
+                    replayed_count, status, details, created_at, updated_at
+                FROM recovery_log
+                ORDER BY created_at DESC
+                LIMIT 1000
+            """, fetch=True)
+            
+            db.close()
+            
+            # Handle cases where queries return error dicts instead of lists
+            if not isinstance(transaction_logs, list):
+                transaction_logs = []
+            if not isinstance(replication_logs, list):
+                replication_logs = []
+            if not isinstance(recovery_logs, list):
+                recovery_logs = []
+            
+            return transaction_logs, replication_logs, recovery_logs
+            
+        except Exception as e:
+            st.error(f"Error fetching logs: {str(e)}")
+            return [], [], []
 
 def insert_replication_log(source_node, target_node, trans_id, op_type, old_amount, new_amount):
     """Insert PENDING entry into replication_log on the source node and return log_id."""
@@ -1153,7 +1212,7 @@ def replicate_from_central(target_node, query, params, trans_id=None, op_type=No
             pass
     return success, error_msg
 
-# RECOVERY MODULE
+# RECOVERY MODULE ==============================
 # TODO (jeff): all functions here
 def log_write_operation(node, query, params, transaction_id):
     """
@@ -1283,11 +1342,6 @@ def get_table_data(node_name, trans=None, limit=100):
     db.close()
     return result
 
-# STREAMLIT UI 
-st.set_page_config(page_title="Distributed Database System", layout="wide")
-st.title("MCO2: Transaction Management & Recovery")
-st.markdown("### Corpuz, Cumti, Pineda, & Punsalan")
-
 # Sidebar - Node Status
 with st.sidebar:
     st.header("Node Status")
@@ -1328,7 +1382,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Database View", 
     "Concurrency Testing", 
     "Failure Recovery", 
-    "Transaction Logs",
+    "Log Tracking",
     "Database Operations"
 ])
 
@@ -1510,9 +1564,87 @@ with tab3:
         st.info("No recovery logs available yet...")
 
 
-# TAB 4: TRANSACTION LOGS ==============================
+# TAB 4: Logging ==============================
 with tab4:
     st.header("Transaction & Replication Logs")
+    
+    # FETCH DATA FROM DATABASE - Define the function inside the tab
+    def fetch_logs_from_db():
+        """Fetch all logs from the database"""
+        try:
+            # Use Central Node to fetch logs (or whichever node stores your logs)
+            db = DatabaseConnection(NODE_CONFIGS["Central Node"])
+            if not db.connect():
+                st.error("Failed to connect to database for logs")
+                return [], [], []
+            
+            # Transaction logs
+            transaction_logs = db.execute_query("""
+                SELECT log_id, trans_id, node, table_name, op_type, 
+                       pk_value, old_amount, new_amount, status, 
+                       error_message, started_at, ended_at
+                FROM transaction_log
+                ORDER BY started_at DESC
+                LIMIT 1000
+            """, fetch=True)
+            
+            # Replication logs
+            replication_logs = db.execute_query("""
+                SELECT log_id, source_node, target_node, trans_id, 
+                       old_amount, new_amount, op_type, status, 
+                       error_message, created_at, completed_at
+                FROM replication_log
+                ORDER BY created_at DESC
+                LIMIT 1000
+            """, fetch=True)
+            
+            # Recovery logs
+            recovery_logs = db.execute_query("""
+                SELECT log_id, node, downtime_start, downtime_end, 
+                       replayed_count, status, details, created_at, updated_at
+                FROM recovery_log
+                ORDER BY created_at DESC
+                LIMIT 1000
+            """, fetch=True)
+            
+            db.close()
+            
+            # Handle cases where queries return error dicts instead of lists
+            if not isinstance(transaction_logs, list):
+                transaction_logs = []
+            if not isinstance(replication_logs, list):
+                replication_logs = []
+            if not isinstance(recovery_logs, list):
+                recovery_logs = []
+            
+            return transaction_logs, replication_logs, recovery_logs
+            
+        except Exception as e:
+            st.error(f"Error fetching logs: {str(e)}")
+            return [], [], []
+    
+    # Fetch logs and store in session state
+    if st.button("Refresh Logs", key="refresh_logs"):
+        transaction_logs, replication_logs, recovery_logs = fetch_logs_from_db()
+        st.session_state["transaction_log_db"] = transaction_logs
+        st.session_state["replication_log_db"] = replication_logs
+        st.session_state["recovery_log_db"] = recovery_logs
+        st.success("Logs refreshed!")
+    
+    # Initialize session state if not exists - wrapped in try/except
+    if ("transaction_log_db" not in st.session_state or 
+        "replication_log_db" not in st.session_state or 
+        "recovery_log_db" not in st.session_state):
+        try:
+            transaction_logs, replication_logs, recovery_logs = fetch_logs_from_db()
+            st.session_state["transaction_log_db"] = transaction_logs
+            st.session_state["replication_log_db"] = replication_logs
+            st.session_state["recovery_log_db"] = recovery_logs
+        except Exception as e:
+            st.error(f"Failed to initialize logs: {str(e)}")
+            st.session_state["transaction_log_db"] = []
+            st.session_state["replication_log_db"] = []
+            st.session_state["recovery_log_db"] = []
     
     log_type = st.selectbox(
         "Select Log Type",
@@ -1521,55 +1653,68 @@ with tab4:
     )
     
     # filtering options
-    nodes = ["Central Node", "Node 2", "Node 3"]
+    nodes = ["Central", "Node2", "Node3"]  # Match your log format
     selected_node = st.selectbox("Select Node", ["All Nodes"] + nodes, key="selected_node")
     
-    start_time = st.date_input("Start Date",  min_value=datetime(1993, 1, 1).date(), max_value=datetime(1995, 12, 31).date(), value=None, key="start_time")
-    end_time = st.date_input("End Date",  min_value=datetime(1993, 1, 1).date(), max_value=datetime(1995, 12, 31).date(), value=None, key="end_time")
+    start_time = st.date_input("Start Date", min_value=datetime(1993, 1, 1).date(), 
+                               max_value=datetime(2025, 12, 31).date(), value=None, key="start_time")
+    end_time = st.date_input("End Date", min_value=datetime(1993, 1, 1).date(), 
+                             max_value=datetime(2025, 12, 31).date(), value=None, key="end_time")
 
-    status_options = ["All", "Success", "Failed"]
+    status_options = ["All", "PENDING", "COMMITTED", "ROLLED_BACK", "FAILED", "SUCCESS", "PARTIAL", "IN_PROGRESS"]
     selected_status = st.selectbox("Status", status_options, key="selected_status")
     
     transaction_id_filter = st.text_input("Transaction ID (optional)")
     
-    def filter_logs(df):
+    def filter_logs(df, timestamp_col="started_at"):
         if df is None or df.empty:
             return pd.DataFrame()
         
         filtered = df.copy()
+        
+        # Filter by node
         if selected_node != "All Nodes" and "node" in filtered.columns:
             filtered = filtered[filtered["node"] == selected_node]
+        
+        # Filter by status
         if selected_status != "All" and "status" in filtered.columns:
-            filtered = filtered[filtered["status"].str.lower() == selected_status.lower()]
-        if transaction_id_filter and "transaction_id" in filtered.columns:
-            filtered = filtered[filtered["transaction_id"].astype(str).str.contains(transaction_id_filter)]
-        if start_time and "timestamp" in filtered.columns:
-            filtered = filtered[pd.to_datetime(filtered["timestamp"]).dt.date >= start_time]
-        if end_time and "timestamp" in filtered.columns:
-            filtered = filtered[pd.to_datetime(filtered["timestamp"]).dt.date <= end_time]
+            filtered = filtered[filtered["status"].str.upper() == selected_status.upper()]
+        
+        # Filter by transaction ID
+        if transaction_id_filter and "trans_id" in filtered.columns:
+            filtered = filtered[filtered["trans_id"].astype(str).str.contains(transaction_id_filter, na=False)]
+        
+        # Filter by date range
+        if timestamp_col in filtered.columns:
+            if start_time:
+                filtered = filtered[pd.to_datetime(filtered[timestamp_col], errors='coerce').dt.date >= start_time]
+            if end_time:
+                filtered = filtered[pd.to_datetime(filtered[timestamp_col], errors='coerce').dt.date <= end_time]
+        
         return filtered
     
     # Display logs
-    def display_log(name, log_data):
+    def display_log(name, log_data, timestamp_col="started_at"):
         st.subheader(name)
         if log_data:
             df = pd.DataFrame(log_data)
-            df = filter_logs(df)
+            df = filter_logs(df, timestamp_col)
             if not df.empty:
                 st.dataframe(df, use_container_width=True, height=400)
+                st.caption(f"Showing {len(df)} records")
             else:
-                st.info(f"No {name.lower()} for selected filters")
+                st.info(f"No {name.lower()} match the selected filters")
         else:
-            st.info(f"No {name.lower()} yet")
+            st.info(f"No {name.lower()} found in database")
     
     if log_type in ["Transaction Logs", "All Logs"]:
-        display_log("Transaction Logs", st.session_state.get("transaction_log", []))
+        display_log("Transaction Logs", st.session_state.get("transaction_log_db", []), "started_at")
     
     if log_type in ["Replication Logs", "All Logs"]:
-        display_log("Replication Logs", st.session_state.get("replication_log", []))
+        display_log("Replication Logs", st.session_state.get("replication_log_db", []), "created_at")
     
     if log_type in ["Recovery Logs", "All Logs"]:
-        display_log("Recovery Logs", st.session_state.get("recovery_log", []))
+        display_log("Recovery Logs", st.session_state.get("recovery_log_db", []), "created_at")
     
     
 # TAB 5: MANUAL OPERATIONS ==============================
