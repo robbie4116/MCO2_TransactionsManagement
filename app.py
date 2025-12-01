@@ -1935,6 +1935,23 @@ def invalidate_log_cache():
     for key in ("transaction_log_db", "replication_log_db", "recovery_log_db"):
         st.session_state.pop(key, None)
 
+def clear_all_logs():
+    """Truncate transaction/replication/recovery logs on all nodes."""
+    for node_name, cfg in NODE_CONFIGS.items():
+        db = DatabaseConnection(cfg)
+        if not db.connect():
+            continue
+        try:
+            for table in ("transaction_log", "replication_log", "recovery_log"):
+                db.execute_query(f"TRUNCATE TABLE {table}", fetch=False)
+        finally:
+            db.close()
+    # clear in-memory caches
+    st.session_state.transaction_log = []
+    st.session_state.replication_log = []
+    st.session_state.recovery_log = []
+    invalidate_log_cache()
+
 # Sidebar - Node Status
 with st.sidebar:
     st.header("Node Status")
@@ -1948,10 +1965,8 @@ with st.sidebar:
     st.header("Quick Actions")
     
     if st.button("Clear All Logs"):
-        st.session_state.transaction_log = []
-        st.session_state.replication_log = []
-        st.session_state.recovery_log = []
-        st.rerun()
+        clear_all_logs()
+        st.experimental_rerun()
 
 # MAIN TABS ==============================
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -1969,7 +1984,7 @@ with tab1:
     limit = st.number_input("Row Limit", min_value=10, step=100)
 
     if st.button("Refresh Data"):
-        st.rerun()
+        st.experimental_rerun()
         
     st.subheader("Central Node")
     try:
