@@ -2220,42 +2220,101 @@ with tab4:
             st.error(f"Error fetching logs: {str(e)}")
             return [], [], []
     
-    # Fetch logs and store in session state
-    if st.button("Refresh Logs", key="refresh_logs"):
-        transaction_logs, replication_logs, recovery_logs = fetch_logs_from_db()
-        st.session_state["transaction_log_db"] = transaction_logs
-        st.session_state["replication_log_db"] = replication_logs
-        st.session_state["recovery_log_db"] = recovery_logs
-        st.success("Logs refreshed!")
-    
-    # Initialize session state if not exists - wrapped in try/except
-    if ("transaction_log_db" not in st.session_state or 
-        "replication_log_db" not in st.session_state or 
-        "recovery_log_db" not in st.session_state):
+    # Map UI names to config keys and short names
+    node_display = ["Central Node", "Node 2", "Node 3"]
+    node_map = {
+        "Central Node": "Central Node",
+        "Node 2": "Node 2",
+        "Node 3": "Node 3",
+    }
+    node_short = {
+        "Central Node": "Central",
+        "Node 2": "Node2",
+        "Node 3": "Node3",
+    }
+    # per-node cache in session_state
+    if "logs_cache" not in st.session_state:
+        st.session_state.logs_cache = {}
+
+    def fetch_logs_from_node(node_name):
+        """Fetch logs from the specified node."""
         try:
-            transaction_logs, replication_logs, recovery_logs = fetch_logs_from_db()
-            st.session_state["transaction_log_db"] = transaction_logs
-            st.session_state["replication_log_db"] = replication_logs
-            st.session_state["recovery_log_db"] = recovery_logs
+            db = DatabaseConnection(NODE_CONFIGS[node_name])
+            if not db.connect():
+                st.error(f"Failed to connect to {node_name} for logs")
+                return [], [], []
+            transaction_logs = db.execute_query(
+                """
+                SELECT log_id, trans_id, node, table_name, op_type, 
+                       pk_value, old_amount, new_amount, status, 
+                       error_message, started_at, ended_at
+                FROM transaction_log
+                ORDER BY started_at DESC
+                LIMIT 1000
+                """,
+                fetch=True
+            )
+            replication_logs = db.execute_query(
+                """
+                SELECT log_id, source_node, target_node, trans_id, 
+                       old_amount, new_amount, op_type, status, 
+                       error_message, created_at, completed_at
+                FROM replication_log
+                ORDER BY created_at DESC
+                LIMIT 1000
+                """,
+                fetch=True
+            )
+            recovery_logs = db.execute_query(
+                """
+                SELECT log_id, node, downtime_start, downtime_end, 
+                       replayed_count, status, details, created_at, updated_at
+                FROM recovery_log
+                ORDER BY created_at DESC
+                LIMIT 1000
+                """,
+                fetch=True
+            )
+            db.close()
+            return (
+                transaction_logs if isinstance(transaction_logs, list) else [],
+                replication_logs if isinstance(replication_logs, list) else [],
+                recovery_logs if isinstance(recovery_logs, list) else [],
+            )
         except Exception as e:
-            st.error(f"Failed to initialize logs: {str(e)}")
-            st.session_state["transaction_log_db"] = []
-            st.session_state["replication_log_db"] = []
-            st.session_state["recovery_log_db"] = []
-    
+            st.error(f"Error fetching logs from {node_name}: {e}")
+            return [], [], []
+
+    selected_node = st.selectbox("Select Node", node_display, key="selected_node")
+
+    if st.button("Refresh Logs", key="refresh_logs"):
+        tx, rep, rec = fetch_logs_from_node(node_map[selected_node])
+        st.session_state.logs_cache[node_map[selected_node]] = {
+            "tx": tx,
+            "rep": rep,
+            "rec": rec,
+        }
+        st.success(f"Logs refreshed from {selected_node}")
+
+    # Ensure we have data for the selected node
+    if node_map[selected_node] not in st.session_state.logs_cache:
+        tx, rep, rec = fetch_logs_from_node(node_map[selected_node])
+        st.session_state.logs_cache[node_map[selected_node]] = {
+            "tx": tx,
+            "rep": rep,
+            "rec": rec,
+        }
+
     log_type = st.selectbox(
         "Select Log Type",
         ["Transaction Logs", "Replication Logs", "Recovery Logs", "All Logs"],
-        key = "log_type"
+        key="log_type"
     )
     
     # filtering options
-    nodes = ["Central", "Node2", "Node3"]  # Match your log format
-    selected_node = st.selectbox("Select Node", ["All Nodes"] + nodes, key="selected_node")
-    
-    start_time = st.date_input("Start Date", min_value=datetime(1993, 1, 1).date(), 
+    start_time = st.date_input("Start Date", min_value=datetime(1993, 1, 1).date(),
                                max_value=datetime(2025, 12, 31).date(), value=None, key="start_time")
-    end_time = st.date_input("End Date", min_value=datetime(1993, 1, 1).date(), 
+    end_time = st.date_input("End Date", min_value=datetime(1993, 1, 1).date(),
                              max_value=datetime(2025, 12, 31).date(), value=None, key="end_time")
 
     status_options = ["All", "PENDING", "COMMITTED", "ROLLED_BACK", "FAILED", "SUCCESS", "PARTIAL", "IN_PROGRESS"]
@@ -2269,9 +2328,9 @@ with tab4:
         
         filtered = df.copy()
         
-        # Filter by node
-        if selected_node != "All Nodes" and "node" in filtered.columns:
-            filtered = filtered[filtered["node"] == selected_node]
+        # Filter by node (match short names)
+        if "node" in filtered.columns:
+            filtered = filtered[filtered["node"] == node_short[selected_node]]
         
         # Filter by status
         if selected_status != "All" and "status" in filtered.columns:
@@ -2304,14 +2363,16 @@ with tab4:
         else:
             st.info(f"No {name.lower()} found in database")
     
+    cache = st.session_state.logs_cache.get(node_map[selected_node], {"tx": [], "rep": [], "rec": []})
+
     if log_type in ["Transaction Logs", "All Logs"]:
-        display_log("Transaction Logs", st.session_state.get("transaction_log_db", []), "started_at")
+        display_log("Transaction Logs", cache.get("tx", []), "started_at")
     
     if log_type in ["Replication Logs", "All Logs"]:
-        display_log("Replication Logs", st.session_state.get("replication_log_db", []), "created_at")
+        display_log("Replication Logs", cache.get("rep", []), "created_at")
     
     if log_type in ["Recovery Logs", "All Logs"]:
-        display_log("Recovery Logs", st.session_state.get("recovery_log_db", []), "created_at")
+        display_log("Recovery Logs", cache.get("rec", []), "created_at")
     
     
 # TAB 5: MANUAL OPERATIONS ==============================
