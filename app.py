@@ -62,15 +62,11 @@ NODE_CONFIGS = {
     "Node 2": {
         "host": "ccscloud.dlsu.edu.ph",  # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
         "port": 60704, # TO RUN LOCAL, change to 60704
-        "host": "ccscloud.dlsu.edu.ph",  # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
-        "port": 60704, # TO RUN LOCAL, change to 60704
         "user": "user1",
         "password": "UserPass123!",
         "database": "mco2financedata"
     },
     "Node 3": {
-        "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
-        "port": 60705, # TO RUN LOCAL, change to 60705
         "host": "ccscloud.dlsu.edu.ph", # TO RUN LOCAL, change to ccscloud.dlsu.edu.ph
         "port": 60705, # TO RUN LOCAL, change to 60705
         "user": "user1",
@@ -118,6 +114,13 @@ class DatabaseConnection:
         self.in_transaction = False  # Track if we're in a managed transaction
         
     def connect(self):
+        # honor simulated offline state based on node config
+        try:
+            for name, cfg in NODE_CONFIGS.items():
+                if cfg == self.config and not st.session_state.node_status.get(name, True):
+                    return False
+        except Exception:
+            pass
         try:
             self.connection = mysql.connector.connect(**self.config)
             # Set timezone to Manila for this connection
@@ -1702,13 +1705,28 @@ def log_write_operation(node, query, params, transaction_id):
     """
     Log write operations for recovery purposes
     
-    TODO (jeff): Implement write-ahead logging or similar mechanism
-    This log will be used when nodes recover from failure to replay missed transactions
-    
-    Store: timestamp, node, query, params, transaction_id, status
-    Consider: file-based log, database log table, or in-memory structure
+    Basic stub: insert a PENDING entry in transaction_log before execution.
     """
-    pass
+    try:
+        db = DatabaseConnection(NODE_CONFIGS[node])
+        if not db.connect():
+            return None
+        cur = db.connection.cursor()
+        cur.execute(
+            """
+            INSERT INTO transaction_log
+            (trans_id, node, table_name, op_type, pk_value, status, started_at)
+            VALUES (%s, %s, %s, %s, %s, 'PENDING', NOW())
+            """,
+            (transaction_id, to_log_node_name(node), "trans", "UNKNOWN", str(transaction_id)),
+        )
+        db.connection.commit()
+        log_id = cur.lastrowid
+        cur.close()
+        db.close()
+        return log_id
+    except Exception:
+        return None
 
 def simulate_node_failure(node_name):
     print(f"\n{'='*60}")
@@ -1717,28 +1735,37 @@ def simulate_node_failure(node_name):
     
     try: 
         # Get timestamp from MySQL to ensure consistency
-        db = DatabaseConnection(NODE_CONFIGS["Central Node"])
-        if db.connect():
-            failure_time = get_mysql_now(db.connection)
-            
-            # Store in session state
-            st.session_state.node_status[node_name] = False
-            st.session_state.simulated_failures[node_name] = failure_time
-            
-            print(f"[FAILURE SIMULATION] Downtime started at: {failure_time}")
-            
-            cur = db.connection.cursor()
+        db_target = DatabaseConnection(NODE_CONFIGS[node_name])
+        failure_time = None
+        if db_target.connect():
+            failure_time = get_mysql_now(db_target.connection)
+            cur = db_target.connection.cursor()
             cur.execute(
                 "INSERT INTO recovery_log (node, downtime_start, status) VALUES (%s, %s, 'FAILED')",
                 (to_log_node_name(node_name), failure_time)
             )
-            db.connection.commit()
+            db_target.connection.commit()
             cur.close()
-            db.close()
+            db_target.close()
         else:
-            # Fallback if can't connect
-            st.session_state.node_status[node_name] = False
-            st.session_state.simulated_failures[node_name] = datetime.now()
+            # fallback to central to record the failure time
+            db_central = DatabaseConnection(NODE_CONFIGS["Central Node"])
+            if db_central.connect():
+                failure_time = get_mysql_now(db_central.connection)
+                cur = db_central.connection.cursor()
+                cur.execute(
+                    "INSERT INTO recovery_log (node, downtime_start, status) VALUES (%s, %s, 'FAILED')",
+                    (to_log_node_name(node_name), failure_time)
+                )
+                db_central.connection.commit()
+                cur.close()
+                db_central.close()
+        if failure_time is None:
+            failure_time = datetime.now()
+        # Store in session state
+        st.session_state.node_status[node_name] = False
+        st.session_state.simulated_failures[node_name] = failure_time
+        print(f"[FAILURE SIMULATION] Downtime started at: {failure_time}")
     except Exception as e:
         print(f"[FAILURE SIMULATION] Exception: {e}")
         st.warning(f"Failed to log failure for {node_name}: {e}")
@@ -1762,10 +1789,6 @@ def simulate_node_recovery(node_name):
     st.session_state.node_status[node_name] = True
     print(f"[RECOVERY] Session state updated: node_status[{node_name}] = True")
     
-    # TODO (jeff): Add recovery logic
-    # 1. Get all missed transactions while node was down
-    # 2. Replay them in order
-    # 3. Handle any conflicts
     if node_name not in st.session_state.simulated_failures:
         print(f"[RECOVERY] {node_name} was never marked as failed")
         st.warning(f"{node_name} was never marked as failed; cannot simulate recovery")
@@ -1788,6 +1811,7 @@ def simulate_node_recovery(node_name):
         print(f"[RECOVERY] Path A: Recovering Central Node from slave nodes")
         source_nodes = ["Node 2", "Node 3"]
         replayed_count = 0
+        total_failed = 0
 
         for src in source_nodes:
             print(f"\n[RECOVERY] Checking {src} for FAILED replications...")
@@ -1820,6 +1844,7 @@ def simulate_node_recovery(node_name):
             failed_reps = curr.fetchall()
             curr.close()
             print(f"[RECOVERY] Found {len(failed_reps)} FAILED replications from {src}")
+            total_failed += len(failed_reps)
             
             # Replay Each missed transaction on Central Node
             for rep in failed_reps:
@@ -1862,6 +1887,15 @@ def simulate_node_recovery(node_name):
                     result = db_central.execute_query(query, params=params, fetch=False)
                     if not (isinstance(result, dict) and result.get("error")):
                         replayed_count += 1
+                        log_transaction_event(
+                            node_name="Central Node",
+                            trans_id=trans_id,
+                            op_type=rep.get("op_type", "UNKNOWN"),
+                            pk_value=str(trans_id),
+                            old_amount=rep.get("old_amount"),
+                            new_amount=rep.get("new_amount"),
+                            status="COMMITTED"
+                        )
                         print(f"[RECOVERY]   Successfully replayed trans_id {rep['trans_id']}")
                         # Mark as REPLAYED in replication_log (this prevents re-processing)
                         update_replication_log_status(
@@ -1874,6 +1908,7 @@ def simulate_node_recovery(node_name):
                     print(f"[RECOVERY]   Could not connect to Central Node for replay")
             db_src.close()
             print(f"[RECOVERY] Finished processing {src}")
+        status_val = "SUCCESS" if replayed_count == total_failed and total_failed > 0 else ("PARTIAL" if replayed_count > 0 else "FAILED")
     else:
         print(f"[RECOVERY] Path B: Recovering {node_name} from Central Node")
         db_central = DatabaseConnection(NODE_CONFIGS["Central Node"])
@@ -1907,6 +1942,7 @@ def simulate_node_recovery(node_name):
         curr.close()
         print(f"[RECOVERY] Found {len(failed_reps)} FAILED replications to {node_name}")
         replayed_count = 0
+        total_failed = len(failed_reps)
 
         #Replay each missed transaction on recovered node
         for rep in failed_reps:
@@ -1950,6 +1986,15 @@ def simulate_node_recovery(node_name):
                 result = db_node.execute_query(query, params=params, fetch=False)
                 if not (isinstance(result, dict) and result.get("error")):
                     replayed_count += 1
+                    log_transaction_event(
+                        node_name=node_name,
+                        trans_id=trans_id,
+                        op_type=rep.get("op_type", "UNKNOWN"),
+                        pk_value=str(trans_id),
+                        old_amount=rep.get("old_amount"),
+                        new_amount=rep.get("new_amount"),
+                        status="COMMITTED"
+                    )
                     print(f"[RECOVERY]   Successfully replayed trans_id {rep['trans_id']}")
                     # Mark as REPLAYED in replication_log
                     update_replication_log_status(
@@ -1961,6 +2006,7 @@ def simulate_node_recovery(node_name):
             else:
                 print(f"[RECOVERY]   Could not connect to {node_name} for replay")
         db_central.close()
+        status_val = "SUCCESS" if replayed_count == total_failed and total_failed > 0 else ("PARTIAL" if replayed_count > 0 else "FAILED")
 
     print(f"\n[RECOVERY] Updating recovery_log in database...")
     db = DatabaseConnection(NODE_CONFIGS[node_name])
@@ -1971,16 +2017,25 @@ def simulate_node_recovery(node_name):
             UPDATE recovery_log
             SET downtime_end = NOW(), 
                 replayed_count = %s,
-                status = 'SUCCESS'
+                status = %s
             WHERE node = %s
                 AND status = 'FAILED'
             ORDER BY downtime_start DESC
             LIMIT 1
             """,
-            (replayed_count, to_log_node_name(node_name),)
+            (replayed_count, status_val, to_log_node_name(node_name),)
         )
         db.connection.commit()
-        print(f"[RECOVERY] Updated recovery_log: replayed_count={replayed_count}, status=SUCCESS")
+        if curr.rowcount == 0:
+            curr.execute(
+                """
+                INSERT INTO recovery_log (node, downtime_start, downtime_end, replayed_count, status)
+                VALUES (%s, %s, NOW(), %s, %s)
+                """,
+                (to_log_node_name(node_name), downtime_start, replayed_count, status_val)
+            )
+            db.connection.commit()
+        print(f"[RECOVERY] Updated recovery_log: replayed_count={replayed_count}, status={status_val}")
         curr.close()
         db.close()
     else:
@@ -1992,7 +2047,7 @@ def simulate_node_recovery(node_name):
         "node": node_name,
         "downtime": str(downtime_end - downtime_start),
         "missed_transactions": replayed_count,
-        "status": "SUCCESS"
+        "status": status_val
     }
     st.session_state.recovery_log.append(recovery_log)
     del st.session_state.simulated_failures[node_name]
@@ -2337,11 +2392,10 @@ def test_node_recovery_missed_writes():
 
 # UTILITY FUNCTIONS 
 def check_node_health(node_name):
-    # Check simulated status first
+    # If simulated offline, return False immediately
     if not st.session_state.node_status.get(node_name, True):
         return False
-    
-    # Then check actual database connection
+    # Otherwise, try a real connection
     db = DatabaseConnection(NODE_CONFIGS[node_name])
     status = db.connect()
     db.close()
@@ -2357,6 +2411,27 @@ def get_table_data(node_name, trans=None, limit=100):
     db.close()
     return result if isinstance(result, list) else []
 
+def invalidate_log_cache():
+    for key in ("transaction_log_db", "replication_log_db", "recovery_log_db"):
+        st.session_state.pop(key, None)
+
+def clear_all_logs():
+    """Truncate transaction/replication/recovery logs on all nodes."""
+    for node_name, cfg in NODE_CONFIGS.items():
+        db = DatabaseConnection(cfg)
+        if not db.connect():
+            continue
+        try:
+            for table in ("transaction_log", "replication_log", "recovery_log"):
+                db.execute_query(f"TRUNCATE TABLE {table}", fetch=False)
+        finally:
+            db.close()
+    # clear in-memory caches
+    st.session_state.transaction_log = []
+    st.session_state.replication_log = []
+    st.session_state.recovery_log = []
+    invalidate_log_cache()
+
 # Sidebar - Node Status
 with st.sidebar:
     st.header("Node Status")
@@ -2370,10 +2445,8 @@ with st.sidebar:
     st.header("Quick Actions")
     
     if st.button("Clear All Logs"):
-        st.session_state.transaction_log = []
-        st.session_state.replication_log = []
-        st.session_state.recovery_log = []
-        st.rerun()
+        clear_all_logs()
+        st.success("Logs cleared across all nodes.")
 
 # MAIN TABS ==============================
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -2395,7 +2468,7 @@ with tab1:
         
     st.subheader("Central Node")
     try:
-        central_data = get_table_data("Central Node", "trans", limit)
+        central_data = get_table_data("Node 2", "trans", limit)
         st.dataframe(central_data, use_container_width=True, height=400)
     except Exception as e:
         st.error(f"Error fetching Central Node data: {e}")
@@ -2870,21 +2943,25 @@ with tab3:
     )
     
     # TODO (emman): Add controls for:
-    # - Which node to fail/recover
     # - Number of transactions to execute during failure
     # - Data to use for testing
     
+    selected_recovery_node = st.selectbox("Select Node", list(NODE_CONFIGS.keys()), key="recovery_node_select")
     col1, col2 = st.columns(2)
     
     with col1:
-        if st.button("Simulate Node Failure"):
-            # TODO (jeff): call simulate_node_failure() for selected node
-            st.warning("Node failure simulated")
+        if st.button("Simulate Node Failure", key="simulate_failure"):
+            simulate_node_failure(selected_recovery_node)
+            invalidate_log_cache()
+            st.warning(f"{selected_recovery_node} failure simulated")
     
     with col2:
-        if st.button("Simulate Node Recovery"):
-            # TODO (jeff): call simulate_node_recovery() for selected node
-            st.success("Node recovery initiated")
+        if st.button("Simulate Node Recovery", key="simulate_recovery"):
+            was_failed = selected_recovery_node in st.session_state.simulated_failures
+            simulate_node_recovery(selected_recovery_node)
+            invalidate_log_cache()
+            if was_failed:
+                st.success(f"{selected_recovery_node} recovery completed")
     
     st.divider()
     
@@ -2901,7 +2978,6 @@ with tab3:
             test_node_recovery_missed_writes()
         
         st.success("Recovery test completed! Check logs.")
-        st.rerun()
     
     st.divider()
     st.subheader("Recovery Log")
@@ -2999,42 +3075,101 @@ with tab4:
             st.error(f"Error fetching logs: {str(e)}")
             return [], [], []
     
-    # Fetch logs and store in session state
-    if st.button("Refresh Logs", key="refresh_logs"):
-        transaction_logs, replication_logs, recovery_logs = fetch_logs_from_db()
-        st.session_state["transaction_log_db"] = transaction_logs
-        st.session_state["replication_log_db"] = replication_logs
-        st.session_state["recovery_log_db"] = recovery_logs
-        st.success("Logs refreshed!")
-    
-    # Initialize session state if not exists - wrapped in try/except
-    if ("transaction_log_db" not in st.session_state or 
-        "replication_log_db" not in st.session_state or 
-        "recovery_log_db" not in st.session_state):
+    # Map UI names to config keys and short names
+    node_display = ["Central Node", "Node 2", "Node 3"]
+    node_map = {
+        "Central Node": "Central Node",
+        "Node 2": "Node 2",
+        "Node 3": "Node 3",
+    }
+    node_short = {
+        "Central Node": "Central",
+        "Node 2": "Node2",
+        "Node 3": "Node3",
+    }
+    # per-node cache in session_state
+    if "logs_cache" not in st.session_state:
+        st.session_state.logs_cache = {}
+
+    def fetch_logs_from_node(node_name):
+        """Fetch logs from the specified node."""
         try:
-            transaction_logs, replication_logs, recovery_logs = fetch_logs_from_db()
-            st.session_state["transaction_log_db"] = transaction_logs
-            st.session_state["replication_log_db"] = replication_logs
-            st.session_state["recovery_log_db"] = recovery_logs
+            db = DatabaseConnection(NODE_CONFIGS[node_name])
+            if not db.connect():
+                st.error(f"Failed to connect to {node_name} for logs")
+                return [], [], []
+            transaction_logs = db.execute_query(
+                """
+                SELECT log_id, trans_id, node, table_name, op_type, 
+                       pk_value, old_amount, new_amount, status, 
+                       error_message, started_at, ended_at
+                FROM transaction_log
+                ORDER BY started_at DESC
+                LIMIT 1000
+                """,
+                fetch=True
+            )
+            replication_logs = db.execute_query(
+                """
+                SELECT log_id, source_node, target_node, trans_id, 
+                       old_amount, new_amount, op_type, status, 
+                       error_message, created_at, completed_at
+                FROM replication_log
+                ORDER BY created_at DESC
+                LIMIT 1000
+                """,
+                fetch=True
+            )
+            recovery_logs = db.execute_query(
+                """
+                SELECT log_id, node, downtime_start, downtime_end, 
+                       replayed_count, status, details, created_at, updated_at
+                FROM recovery_log
+                ORDER BY created_at DESC
+                LIMIT 1000
+                """,
+                fetch=True
+            )
+            db.close()
+            return (
+                transaction_logs if isinstance(transaction_logs, list) else [],
+                replication_logs if isinstance(replication_logs, list) else [],
+                recovery_logs if isinstance(recovery_logs, list) else [],
+            )
         except Exception as e:
-            st.error(f"Failed to initialize logs: {str(e)}")
-            st.session_state["transaction_log_db"] = []
-            st.session_state["replication_log_db"] = []
-            st.session_state["recovery_log_db"] = []
-    
+            st.error(f"Error fetching logs from {node_name}: {e}")
+            return [], [], []
+
+    selected_node = st.selectbox("Select Node", node_display, key="selected_node")
+
+    if st.button("Refresh Logs", key="refresh_logs"):
+        tx, rep, rec = fetch_logs_from_node(node_map[selected_node])
+        st.session_state.logs_cache[node_map[selected_node]] = {
+            "tx": tx,
+            "rep": rep,
+            "rec": rec,
+        }
+        st.success(f"Logs refreshed from {selected_node}")
+
+    # Ensure we have data for the selected node
+    if node_map[selected_node] not in st.session_state.logs_cache:
+        tx, rep, rec = fetch_logs_from_node(node_map[selected_node])
+        st.session_state.logs_cache[node_map[selected_node]] = {
+            "tx": tx,
+            "rep": rep,
+            "rec": rec,
+        }
+
     log_type = st.selectbox(
         "Select Log Type",
         ["Transaction Logs", "Replication Logs", "Recovery Logs", "All Logs"],
-        key = "log_type"
+        key="log_type"
     )
     
     # filtering options
-    nodes = ["Central", "Node2", "Node3"]  # Match your log format
-    selected_node = st.selectbox("Select Node", ["All Nodes"] + nodes, key="selected_node")
-    
-    start_time = st.date_input("Start Date", min_value=datetime(1993, 1, 1).date(), 
+    start_time = st.date_input("Start Date", min_value=datetime(1993, 1, 1).date(),
                                max_value=datetime(2025, 12, 31).date(), value=None, key="start_time")
-    end_time = st.date_input("End Date", min_value=datetime(1993, 1, 1).date(), 
+    end_time = st.date_input("End Date", min_value=datetime(1993, 1, 1).date(),
                              max_value=datetime(2025, 12, 31).date(), value=None, key="end_time")
 
     status_options = ["All", "PENDING", "COMMITTED", "ROLLED_BACK", "FAILED", "SUCCESS", "PARTIAL", "IN_PROGRESS"]
@@ -3048,9 +3183,9 @@ with tab4:
         
         filtered = df.copy()
         
-        # Filter by node
-        if selected_node != "All Nodes" and "node" in filtered.columns:
-            filtered = filtered[filtered["node"] == selected_node]
+        # Filter by node (match short names)
+        if "node" in filtered.columns:
+            filtered = filtered[filtered["node"] == node_short[selected_node]]
         
         # Filter by status
         if selected_status != "All" and "status" in filtered.columns:
@@ -3083,14 +3218,16 @@ with tab4:
         else:
             st.info(f"No {name.lower()} found in database")
     
+    cache = st.session_state.logs_cache.get(node_map[selected_node], {"tx": [], "rep": [], "rec": []})
+
     if log_type in ["Transaction Logs", "All Logs"]:
-        display_log("Transaction Logs", st.session_state.get("transaction_log_db", []), "started_at")
+        display_log("Transaction Logs", cache.get("tx", []), "started_at")
     
     if log_type in ["Replication Logs", "All Logs"]:
-        display_log("Replication Logs", st.session_state.get("replication_log_db", []), "created_at")
+        display_log("Replication Logs", cache.get("rep", []), "created_at")
     
     if log_type in ["Recovery Logs", "All Logs"]:
-        display_log("Recovery Logs", st.session_state.get("recovery_log_db", []), "created_at")
+        display_log("Recovery Logs", cache.get("rec", []), "created_at")
     
 # TAB 5: MANUAL OPERATIONS ==============================
 with tab5:
