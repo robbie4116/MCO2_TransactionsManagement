@@ -1966,7 +1966,7 @@ with st.sidebar:
     
     if st.button("Clear All Logs"):
         clear_all_logs()
-        st.experimental_rerun()
+        st.success("Logs cleared across all nodes.")
 
 # MAIN TABS ==============================
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
