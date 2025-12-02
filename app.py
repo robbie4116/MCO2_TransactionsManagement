@@ -2468,7 +2468,7 @@ with tab1:
         
     st.subheader("Central Node")
     try:
-        central_data = get_table_data("Node 2", "trans", limit)
+        central_data = get_table_data("Central Node", "trans", limit)
         st.dataframe(central_data, use_container_width=True, height=400)
     except Exception as e:
         st.error(f"Error fetching Central Node data: {e}")
